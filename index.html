@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pesquisa de Preço - Versão 4.0 (Edição Ceará & Multi-IA)</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --card-bg: rgba(22, 31, 49, 0.7);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --accent-primary: #8b5cf6;
+            --accent-secondary: #ec4899;
+            --accent-tertiary: #10b981;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            line-height: 1.6;
+            padding: 2rem;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(139, 92, 246, 0.15) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(236, 72, 153, 0.15) 0%, transparent 40%);
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.35rem 1rem;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            border-radius: 9999px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 1rem;
+        }
+
+        h1 {
+            font-size: 2.75rem;
+            font-weight: 700;
+            background: linear-gradient(to right, #fff, #9ca3af);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.75rem;
+        }
+
+        p.subtitle {
+            color: var(--text-muted);
+            font-size: 1.15rem;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 1.75rem;
+            transition: transform 0.2s ease, border-color 0.2s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-4px);
+            border-color: rgba(139, 92, 246, 0.4);
+        }
+
+        .card h2 {
+            font-size: 1.35rem;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: #fff;
+        }
+
+        .card ul {
+            list-style: none;
+        }
+
+        .card li {
+            position: relative;
+            padding-left: 1.5rem;
+            margin-bottom: 0.75rem;
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+
+        .card li::before {
+            content: "✦";
+            position: absolute;
+            left: 0;
+            color: var(--accent-primary);
+        }
+
+        .highlight-box {
+            background: rgba(16, 185, 129, 0.08);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .highlight-box h3 {
+            color: var(--accent-tertiary);
+            font-size: 1.2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .store-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .tag {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid var(--border-color);
+            padding: 0.4rem 0.8rem;
+            border-radius: 0.5rem;
+            font-size: 0.85rem;
+            color: #e5e7eb;
+        }
+
+        .code-block {
+            background: #030712;
+            border: 1px solid var(--border-color);
+            border-radius: 0.75rem;
+            padding: 1.25rem;
+            font-family: monospace;
+            font-size: 0.9rem;
+            color: #34d399;
+            overflow-x: auto;
+            margin-top: 1rem;
+        }
+
+        footer {
+            text-align: center;
+            padding-top: 2rem;
+            border-top: 1px solid var(--border-color);
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <span class="badge">Versão 4.0 Final</span>
+            <h1>Pesquisa de Preço & EAN - Edição Ceará</h1>
+            <p class="subtitle">Multi-IA Operacional • OCR Vision por Screenshot • 11 Supermercados • Compilador em Executável (.exe)</p>
+        </header>
+
+        <div class="highlight-box">
+            <h3>🚀 Novidades da Versão 4.0</h3>
+            <p>A versão 4.0 unifica o pipeline scraping com um cluster de Inteligência Artificial Conjunta (GPT-4o, Gemini 1.5 Flash e Groq) e leitura visual por OCR de tela para produtos difíceis de rastrear em todo o estado do Ceará.</p>
+            
+            <div class="store-tags">
+                <span class="tag">🛒 Diniz</span>
+                <span class="tag">🛒 loja oestes São Luiz</span>
+                <span class="tag">🛒 Atacadão</span>
+                <span class="tag">🛒 Assaí Atacadista</span>
+                <span class="tag">🛒 Carrefour</span>
+                <span class="tag">🛒 Cometa</span>
+                <span class="tag">🛒 Bom Preço CE</span>
+                <span class="tag">🛒 Mercantil Rodrigues</span>
+                <span class="tag">🛒 Big Bompreço</span>
+                <span class="tag">🛒 Atakarejo</span>
+                <span class="tag">🛒 Pinheiro</span>
+            </div>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h2>🤖 Multi-IA Conjunta</h2>
+                <ul>
+                    <li><strong>GPT-4o Mini:</strong> Normaliza nomes digitados e sugere termos alternativos de busca.</li>
+                    <li><strong>Vision OCR:</strong> Captura screenshot da página e usa GPT-4o / Gemini Flash para ler nome, preço e EAN direto da imagem.</li>
+                    <li><strong>Resumos Inteligentes:</strong> Analisa menor preço, diferença percentual e ofertas automaticamente.</li>
+                </ul>
+            </div>
+
+            <div class="card">
+                <h2>🔍 Estratégia de Busca Híbrida</h2>
+                <ul>
+                    <li><strong>API VTEX / JSON:</strong> Chamadas nativas de alta velocidade para Atacadão, Assaí, Carrefour e Diniz.</li>
+                    <li><strong>Barra do Google:</strong> Digita <code>"produto + supermercado"</code> direto no Google para contornar bloqueios.</li>
+                    <li><strong>Fallback Visual:</strong> Se tudo falhar, tira screenshot da tela e extrai visualmente.</li>
+                </ul>
+            </div>
+
+            <div class="card">
+                <h2>📦 Geração de Executável (.exe)</h2>
+                <ul>
+                    <li>Sem dependências de Python no computador do cliente final.</li>
+                    <li>Inclui script <code>gerar_executavel.py</code> (PyInstaller automático).</li>
+                    <li>Arquivo de projeto <code>installer_config.iss</code> para Inno Setup.</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="card" style="margin-bottom: 2.5rem;">
+            <h2>🛠️ Como Executar ou Compilar</h2>
+            <p style="color: var(--text-muted); margin-bottom: 0.5rem;">Para rodar em modo desenvolvimento:</p>
+            <div class="code-block">python v4/pesquisa_preco_v4.py</div>
+            
+            <p style="color: var(--text-muted); margin-top: 1rem; margin-bottom: 0.5rem;">Para gerar a pasta executável (.exe):</p>
+            <div class="code-block">python v4/gerar_executavel.py</div>
+        </div>
+
+        <footer>
+            <p>Sistema de Inteligência de Preços & EAN • Versão 4.0 (Ceará)</p>
+        </footer>
+    </div>
+</body>
+</html>

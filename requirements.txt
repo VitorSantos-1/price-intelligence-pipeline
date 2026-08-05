@@ -1,0 +1,26 @@
+# Dependências do Pesquisa de Preço v3
+# Instale com: pip install -r requirements.txt
+# Para instalar o Playwright após o pip: playwright install chromium
+
+# Core
+playwright>=1.43.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+python-dotenv>=1.0.0
+
+# IA - OpenAI (GPT-4o, GPT-4o-mini, Vision)
+openai>=1.30.0
+
+# IA - Gemini Vision (opcional mas recomendado)
+google-generativeai>=0.7.0
+
+# IA - Groq / LLaMA (opcional, tarefa rápidas)
+groq>=0.9.0
+
+# Vision / Imagens
+Pillow>=10.0.0
+
+# Exibição e exportação
+tabulate>=0.9.0
+colorama>=0.4.6
+pdfplumber>=0.11.0

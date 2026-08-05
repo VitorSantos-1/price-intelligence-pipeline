@@ -1,0 +1,21 @@
+produto;loja;preco;em_oferta;data
+Refrigerante Cola 2L;Loja Central;10.21;Sim;2026-08-01
+Refrigerante Cola 2L;Concorrente Alfa;9.95;Sim;2026-08-01
+Refrigerante Cola 2L;Concorrente Beta;10.9;Sim;2026-08-01
+Refrigerante Cola 2L;Concorrente Gama;12.67;Sim;2026-08-01
+Arroz Tipo 1 5kg;Loja Central;4.93;Sim;2026-08-01
+Arroz Tipo 1 5kg;Concorrente Alfa;4.66;Não;2026-08-01
+Arroz Tipo 1 5kg;Concorrente Beta;4.4;Sim;2026-08-01
+Arroz Tipo 1 5kg;Concorrente Gama;5.67;Sim;2026-08-01
+Feijão Carioca 1kg;Loja Central;16.43;Sim;2026-08-01
+Feijão Carioca 1kg;Concorrente Alfa;14.73;Sim;2026-08-01
+Feijão Carioca 1kg;Concorrente Beta;15.91;Sim;2026-08-01
+Feijão Carioca 1kg;Concorrente Gama;17.12;Não;2026-08-01
+Óleo de Soja 900ml;Loja Central;17.42;Sim;2026-08-01
+Óleo de Soja 900ml;Concorrente Alfa;16.94;Sim;2026-08-01
+Óleo de Soja 900ml;Concorrente Beta;15.95;Sim;2026-08-01
+Óleo de Soja 900ml;Concorrente Gama;16.86;Sim;2026-08-01
+Café Torrado 500g;Loja Central;15.28;Não;2026-08-01
+Café Torrado 500g;Concorrente Alfa;14.99;Não;2026-08-01
+Café Torrado 500g;Concorrente Beta;14.54;Sim;2026-08-01
+Café Torrado 500g;Concorrente Gama;16.41;Sim;2026-08-01
