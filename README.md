@@ -1,4 +1,4 @@
-# 🛒 Price Intelligence Pipeline — Inteligência de Preços da Concorrência
+# Price Intelligence Pipeline, Inteligência de Preços da Concorrência
 
 Pipeline em **Python assíncrono** que coleta preços de vários supermercados concorrentes,
 consolida os resultados e gera um **resumo comparativo automático usando IA** (múltiplos provedores de LLM).
