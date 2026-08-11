@@ -2,7 +2,7 @@
 
 Pipeline em **Python assíncrono** que coleta preços de vários supermercados concorrentes,
 consolida os resultados e gera um **resumo comparativo automático usando IA** (múltiplos provedores de LLM).
-Evoluído por 4 versões, com **interface gráfica** e empacotamento em executável.
+Evoluído por várias versões até o app desktop **Falcons Data**, com **interface gráfica** e empacotamento em executável.
 
 > ⚠️ **Aviso sobre os dados**
 > Todos os dados presentes neste repositório (planilhas, seeds, exemplos) são **fictícios** e foram
@@ -11,14 +11,17 @@ Evoluído por 4 versões, com **interface gráfica** e empacotamento em executá
 > de terceiros foi incluído aqui.
 
 ## 🎯 O que faz
-- Coleta preços de **+8 redes concorrentes** via APIs de catálogo (VTEX) e seletores CSS por loja.
+- Coleta preços de **+11 redes concorrentes** via APIs de catálogo (VTEX), seletores CSS por loja
+  e **navegação completa por categoria** (paginação até o fim, sem limite artificial de páginas).
 - Executa as buscas de forma **assíncrona** (`asyncio`) para paralelizar as consultas.
 - **Auto-aprendizado de seletores:** quando um layout muda, o pipeline aprende o novo seletor CSS e o
   guarda em um `selectors.json` (cache gerado em tempo de execução, fora do repositório).
+- **Monitor de preços:** watchlist de produtos com histórico persistido em **SQLite** para acompanhar variação.
+- **Sites customizados:** o próprio usuário cadastra novas lojas (URL de busca) para entrarem na coleta.
 - Envia os resultados para **4 provedores de LLM** (Gemini, Groq/Llama, GPT-4o-mini via OpenRouter e HuggingFace)
   e gera um resumo curto: loja mais barata, diferença %, ofertas.
 - Exporta os resultados em **CSV** e registra tudo em **logs estruturados**.
-- Possui **GUI** (`app_gui.py`) e script de empacotamento em `.exe` (`gerar_executavel.py`).
+- Possui **GUI** (`app_gui.py` — app desktop *Falcons Data*) e script de empacotamento em `.exe` (`gerar_executavel.py`).
 
 ## 🏗️ Arquitetura
 ```

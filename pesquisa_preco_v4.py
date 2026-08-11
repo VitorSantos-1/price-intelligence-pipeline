@@ -9,10 +9,11 @@ import base64
 import io
 import sys
 import threading
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from datetime import datetime
 from bs4 import BeautifulSoup
-from urllib.parse import quote, quote_plus, urlparse
+from urllib.parse import quote, quote_plus, urlparse, parse_qs
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from colorama import Fore, Style, init
 from tabulate import tabulate
@@ -143,6 +144,9 @@ os.makedirs(CSV_DIR, exist_ok=True)
 # VALIDADOR DE EAN & AUTO-APRENDIZADO (SELECTORS)
 # ==========================================
 ARQUIVO_SELETORES = os.path.join(_USER_DATA_DIR, "selectors.json")
+ARQUIVO_SITES_CUSTOM = os.path.join(_USER_DATA_DIR, "sites_customizados.json")
+ARQUIVO_WATCHLIST = os.path.join(_USER_DATA_DIR, "monitor_watchlist.json")
+ARQUIVO_HISTORICO = os.path.join(_USER_DATA_DIR, "historico_precos.db")
 
 # Regex para aspas em HTML (dupla ou simples) -- usa \x27 para aspa simples
 RE_ASPAS = re.compile(r'["\x27]')
@@ -183,6 +187,188 @@ def salvar_seletor_personalizado(chave, cfg):
         logger.info("Seletor para '%s' salvo.", chave)
     except Exception as e:
         logger.error("Erro ao salvar selectors.json: %s", e)
+
+
+# ==========================================
+# SITES CUSTOMIZADOS (cadastrados pelo usuario para entrar na busca)
+# ==========================================
+def _normalizar_url_busca(url: str) -> str:
+    """Garante http(s) e a presenca do marcador {produto} na URL de busca."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not url.lower().startswith("http"):
+        url = "https://" + url
+    if "{produto}" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}q={{produto}}"
+    return url
+
+
+def _slug_chave(nome: str) -> str:
+    base = re.sub(r'[^a-z0-9]+', '', (nome or '').lower())[:20] or "site"
+    return "custom_" + base
+
+
+def carregar_sites_customizados() -> list:
+    """Lista de sites cadastrados: [{'chave','nome','url_busca'}]."""
+    if os.path.exists(ARQUIVO_SITES_CUSTOM):
+        try:
+            with open(ARQUIVO_SITES_CUSTOM, 'r', encoding='utf-8') as f:
+                dados = json.load(f)
+                return dados if isinstance(dados, list) else []
+        except Exception as e:
+            logger.warning("Erro ao carregar sites_customizados.json: %s", e)
+    return []
+
+
+def salvar_site_customizado(nome: str, url_busca: str) -> dict:
+    """Cadastra um novo site. Retorna o dict salvo (ou {} se invalido)."""
+    nome = (nome or "").strip()
+    url_busca = _normalizar_url_busca(url_busca)
+    if not nome or not url_busca:
+        return {}
+    sites = carregar_sites_customizados()
+    existentes = {s.get("chave") for s in sites}
+    chave = _slug_chave(nome)
+    base, n = chave, 2
+    while chave in existentes:
+        chave = f"{base}{n}"
+        n += 1
+    site = {"chave": chave, "nome": nome, "url_busca": url_busca}
+    sites.append(site)
+    try:
+        with open(ARQUIVO_SITES_CUSTOM, 'w', encoding='utf-8') as f:
+            json.dump(sites, f, indent=2, ensure_ascii=False)
+        logger.info("Site customizado '%s' salvo.", nome)
+    except Exception as e:
+        logger.error("Erro ao salvar site customizado: %s", e)
+    return site
+
+
+def remover_site_customizado(chave: str):
+    sites = [s for s in carregar_sites_customizados() if s.get("chave") != chave]
+    try:
+        with open(ARQUIVO_SITES_CUSTOM, 'w', encoding='utf-8') as f:
+            json.dump(sites, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error("Erro ao remover site customizado: %s", e)
+
+
+def _mapa_lojas_completo() -> dict:
+    """CONCORRENTES + sites customizados (config compativel com raspar_concorrente)."""
+    mapa = dict(CONCORRENTES)
+    for s in carregar_sites_customizados():
+        mapa[s["chave"]] = {
+            "nome": s.get("nome", s["chave"]),
+            "url_busca": s.get("url_busca", ""),
+            "codificador": quote_plus,
+            "customizado": True,
+            "categorias": {},
+        }
+    return mapa
+
+
+# ==========================================
+# MONITOR DE PRECOS (Fase E): watchlist + historico SQLite + variacao
+# ==========================================
+def carregar_watchlist() -> list:
+    if os.path.exists(ARQUIVO_WATCHLIST):
+        try:
+            with open(ARQUIVO_WATCHLIST, 'r', encoding='utf-8') as f:
+                dados = json.load(f)
+                return [str(x) for x in dados] if isinstance(dados, list) else []
+        except Exception as e:
+            logger.warning("Erro ao carregar watchlist: %s", e)
+    return []
+
+
+def salvar_watchlist(termos: list):
+    try:
+        with open(ARQUIVO_WATCHLIST, 'w', encoding='utf-8') as f:
+            json.dump(list(dict.fromkeys(termos)), f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error("Erro ao salvar watchlist: %s", e)
+
+
+def _conexao_historico():
+    con = sqlite3.connect(ARQUIVO_HISTORICO)
+    con.execute("""CREATE TABLE IF NOT EXISTS precos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data TEXT, termo TEXT, loja TEXT, produto TEXT,
+        preco_normal TEXT, preco_oferta TEXT, preco_num REAL
+    )""")
+    return con
+
+
+def _preco_num(*textos) -> float | None:
+    for t in textos:
+        vals = _precos_do_texto(t or "")
+        if vals:
+            return vals[0]
+    return None
+
+
+def monitor_registrar(termo: str, resultados: list):
+    """Grava no historico o preco do produto que MAIS combina com o termo
+    (maior relevancia NLP) em cada loja — nao o item mais barato aleatorio.
+    Assim o monitor acompanha o produto certo, e nao um item minusculo qualquer."""
+    if not resultados:
+        return
+    melhor_por_loja = {}
+    for r in resultados:
+        num = _preco_num(r.get("preco_oferta"), r.get("preco_normal"))
+        if num is None:
+            continue
+        loja = r.get("supermercado", "?")
+        score = r.get("nlp_score", 0.0) or 0.0
+        atual = melhor_por_loja.get(loja)
+        # maior relevancia vence; em empate, o mais barato
+        if atual is None or score > atual[0] or (score == atual[0] and num < atual[1]):
+            melhor_por_loja[loja] = (score, num, r)
+    if not melhor_por_loja:
+        return
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    con = _conexao_historico()
+    try:
+        for loja, (score, num, r) in melhor_por_loja.items():
+            con.execute(
+                "INSERT INTO precos (data,termo,loja,produto,preco_normal,preco_oferta,preco_num) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (agora, termo, loja, r.get("produto_encontrado", ""),
+                 r.get("preco_normal", "—"), r.get("preco_oferta", "—"), num),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def monitor_variacao(termo: str) -> list:
+    """Para cada loja: preco mais recente x anterior, com variacao %."""
+    con = _conexao_historico()
+    try:
+        cur = con.execute(
+            "SELECT loja, preco_num, data, produto FROM precos WHERE termo=? ORDER BY id DESC",
+            (termo,))
+        rows = cur.fetchall()
+    finally:
+        con.close()
+    por_loja = {}
+    for loja, num, data, prod in rows:
+        por_loja.setdefault(loja, []).append((num, data, prod))
+    saida = []
+    for loja, lst in por_loja.items():
+        atual = lst[0]
+        anterior = lst[1] if len(lst) > 1 else None
+        var = None
+        if anterior and anterior[0]:
+            var = (atual[0] - anterior[0]) / anterior[0] * 100.0
+        saida.append({
+            "termo": termo, "loja": loja, "produto": atual[2], "atual": atual[0],
+            "anterior": (anterior[0] if anterior else None), "var": var, "data": atual[1],
+        })
+    saida.sort(key=lambda x: (x["atual"] if x["atual"] is not None else 9e9))
+    return saida
 
 
 def tentar_auto_aprendizado(chave: str, corpo_html: str) -> dict:
@@ -1108,122 +1294,122 @@ def filtrar_e_ordenar_por_nlp(produto_busca: str, resultados: list, limite: floa
 # CONCORRENTES E CABECALHOS
 # ==========================================
 CONCORRENTES = {
-    "diniz": {
-        "nome": "Diniz Supermercados",
-        "url_busca": "https://www.dinizsupermercados.com.br/busca?termo={produto}",
+    "aurora": {
+        "nome": "Aurora Supermercados",
+        "url_busca": "https://www.superaurora.com.br/busca?termo={produto}",
         "codificador": quote,
         "expressao_regular_ean_url": r'ean=(\d{8,14})',
         "categorias": {
-            "Mercearia":                  "https://www.dinizsupermercados.com.br/departamentos/mercearia",
-            "Salgadinhos e Chocolates":   "https://www.dinizsupermercados.com.br/departamentos/salgadinhos-biscoitos-e-chocolates",
-            "Matinais e Sobremesas":      "https://www.dinizsupermercados.com.br/departamentos/matinais-e-sobremesas",
-            "Cereais e Farinaceos":       "https://www.dinizsupermercados.com.br/departamentos/cereais-e-farinaceos",
-            "Carnes":                     "https://www.dinizsupermercados.com.br/departamentos/carnes",
-            "Frios e Laticinios":         "https://www.dinizsupermercados.com.br/departamentos/frios-e-laticinios",
-            "Hortifruti":                 "https://www.dinizsupermercados.com.br/departamentos/hortifruti",
-            "Padaria":                    "https://www.dinizsupermercados.com.br/departamentos/padaria",
-            "Congelados":                 "https://www.dinizsupermercados.com.br/departamentos/congelados",
-            "Bebidas":                    "https://www.dinizsupermercados.com.br/departamentos/bebidas",
-            "Perfumaria, Higiene e Bebe": "https://www.dinizsupermercados.com.br/departamentos/perfumaria-higiene-e-bebe",
-            "Limpeza":                    "https://www.dinizsupermercados.com.br/departamentos/limpeza",
-            "Bazar e Utilidades":         "https://www.dinizsupermercados.com.br/departamentos/bazar-e-utilidades",
-            "Animais":                    "https://www.dinizsupermercados.com.br/departamentos/animais",
-            "Fitness":                    "https://www.dinizsupermercados.com.br/departamentos/fitness",
+            "Mercearia":                  "https://www.superaurora.com.br/departamentos/mercearia",
+            "Salgadinhos e Chocolates":   "https://www.superaurora.com.br/departamentos/salgadinhos-biscoitos-e-chocolates",
+            "Matinais e Sobremesas":      "https://www.superaurora.com.br/departamentos/matinais-e-sobremesas",
+            "Cereais e Farinaceos":       "https://www.superaurora.com.br/departamentos/cereais-e-farinaceos",
+            "Carnes":                     "https://www.superaurora.com.br/departamentos/carnes",
+            "Frios e Laticinios":         "https://www.superaurora.com.br/departamentos/frios-e-laticinios",
+            "Hortifruti":                 "https://www.superaurora.com.br/departamentos/hortifruti",
+            "Padaria":                    "https://www.superaurora.com.br/departamentos/padaria",
+            "Congelados":                 "https://www.superaurora.com.br/departamentos/congelados",
+            "Bebidas":                    "https://www.superaurora.com.br/departamentos/bebidas",
+            "Perfumaria, Higiene e Bebe": "https://www.superaurora.com.br/departamentos/perfumaria-higiene-e-bebe",
+            "Limpeza":                    "https://www.superaurora.com.br/departamentos/limpeza",
+            "Bazar e Utilidades":         "https://www.superaurora.com.br/departamentos/bazar-e-utilidades",
+            "Animais":                    "https://www.superaurora.com.br/departamentos/animais",
+            "Fitness":                    "https://www.superaurora.com.br/departamentos/fitness",
         },
     },
-    "saoluiz": {
-        "nome": "loja oestes Sao Luiz",
-        "url_busca": "https://loja oestessaoluiz.com.br/loja/369?search={produto}",
+    "vizinho": {
+        "nome": "Mercadinhos Vizinho",
+        "url_busca": "https://mercadinhosvizinho.com.br/loja/369?search={produto}",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'ean=(\d{8,14})',
         "clicar_no_produto": True,
         "seletor_link_produto": "a[href*='/produto/']",
-        "url_encartes": "https://loja oestessaoluiz.com.br/loja/355",
+        "url_encartes": "https://mercadinhosvizinho.com.br/loja/355",
         "categorias": {
-            "Ofertas":            "https://loja oestessaoluiz.com.br/loja/355/ofertas",
-            "Hortifruti":         "https://loja oestessaoluiz.com.br/loja/355/categoria/13778",
-            "Acougue":            "https://loja oestessaoluiz.com.br/loja/355/categoria/13780",
-            "Peixaria":           "https://loja oestessaoluiz.com.br/loja/355/categoria/13781",
-            "Padaria":            "https://loja oestessaoluiz.com.br/loja/355/categoria/13782",
-            "Congelados":         "https://loja oestessaoluiz.com.br/loja/355/categoria/13783",
-            "Frios e Laticinios": "https://loja oestessaoluiz.com.br/loja/355/categoria/13784",
-            "Mercearia":          "https://loja oestessaoluiz.com.br/loja/355/categoria/13785",
-            "Doces e Biscoitos":  "https://loja oestessaoluiz.com.br/loja/355/categoria/13786",
-            "Cereais":            "https://loja oestessaoluiz.com.br/loja/355/categoria/13787",
-            "Massas":             "https://loja oestessaoluiz.com.br/loja/355/categoria/13788",
-            "Bebidas":            "https://loja oestessaoluiz.com.br/loja/355/categoria/13789",
-            "Limpeza":            "https://loja oestessaoluiz.com.br/loja/355/categoria/13790",
-            "Higiene e Bebe":     "https://loja oestessaoluiz.com.br/loja/355/categoria/13791",
+            "Ofertas":            "https://mercadinhosvizinho.com.br/loja/355/ofertas",
+            "Hortifruti":         "https://mercadinhosvizinho.com.br/loja/355/categoria/13778",
+            "Acougue":            "https://mercadinhosvizinho.com.br/loja/355/categoria/13780",
+            "Peixaria":           "https://mercadinhosvizinho.com.br/loja/355/categoria/13781",
+            "Padaria":            "https://mercadinhosvizinho.com.br/loja/355/categoria/13782",
+            "Congelados":         "https://mercadinhosvizinho.com.br/loja/355/categoria/13783",
+            "Frios e Laticinios": "https://mercadinhosvizinho.com.br/loja/355/categoria/13784",
+            "Mercearia":          "https://mercadinhosvizinho.com.br/loja/355/categoria/13785",
+            "Doces e Biscoitos":  "https://mercadinhosvizinho.com.br/loja/355/categoria/13786",
+            "Cereais":            "https://mercadinhosvizinho.com.br/loja/355/categoria/13787",
+            "Massas":             "https://mercadinhosvizinho.com.br/loja/355/categoria/13788",
+            "Bebidas":            "https://mercadinhosvizinho.com.br/loja/355/categoria/13789",
+            "Limpeza":            "https://mercadinhosvizinho.com.br/loja/355/categoria/13790",
+            "Higiene e Bebe":     "https://mercadinhosvizinho.com.br/loja/355/categoria/13791",
         },
     },
-    "atacadao": {
-        "nome": "Atacadao",
-        "url_busca": "https://www.atacadao.com.br/s?q={produto}&sort=score_desc&page=0",
+    "atacauno": {
+        "nome": "Atacado Uno",
+        "url_busca": "https://www.atacadouno.com.br/s?q={produto}&sort=score_desc&page=0",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'(?:ean|gtin|barcode)[\/](\d{8,14})',
         "categorias": {},
     },
-    # ── Expansao Ceara ──────────────────────────────────────────────────────
-    "assai": {
-        "nome": "Assai Atacadista",
-        "url_busca": "https://www.assai.com.br/busca?q={produto}&sort=score_desc",
+    # ── Expansao regional ──────────────────────────────────────────────────────
+    "atacadois": {
+        "nome": "Atacado Dois",
+        "url_busca": "https://www.atacadodois.com.br/busca?q={produto}&sort=score_desc",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'(?:ean|gtin|barcode)[\/](\d{8,14})',
         "categorias": {},
-        # Assai usa VTEX, tentar VTEX API diretamente
-        "vtex_api": "https://www.assai.com.br/api/catalog_system/pub/products/search/{produto}?_from=0&_to=9",
+        # Atacado Dois usa VTEX, tentar VTEX API diretamente
+        "vtex_api": "https://www.atacadodois.com.br/api/catalog_system/pub/products/search/{produto}?_from=0&_to=9",
     },
-    "carrefour": {
-        "nome": "Carrefour",
-        "url_busca": "https://www.carrefour.com.br/s?q={produto}&sort=score_desc",
+    "continental": {
+        "nome": "Rede Continental",
+        "url_busca": "https://www.redecontinental.com.br/s?q={produto}&sort=score_desc",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'(?:ean|gtin|barcode)[\/](\d{8,14})',
         "categorias": {},
-        "vtex_api": "https://www.carrefour.com.br/api/catalog_system/pub/products/search/{produto}?_from=0&_to=9",
+        "vtex_api": "https://www.redecontinental.com.br/api/catalog_system/pub/products/search/{produto}?_from=0&_to=9",
     },
-    "cometa": {
-        "nome": "Cometa Supermercados",
-        "url_busca": "https://www.cometasupermercados.com.br/busca?q={produto}",
+    "estrela": {
+        "nome": "Estrela Supermercados",
+        "url_busca": "https://www.estrelasupermercados.com.br/busca?q={produto}",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'ean=(\d{8,14})',
         "categorias": {},
         "usar_google_search": True,  # fallback: busca na barra do Google
     },
-    "bomprece": {
-        "nome": "Bom Preco Supermercados",
-        "url_busca": "https://www.bomprecoce.com.br/busca?q={produto}",
+    "economize": {
+        "nome": "Economize Supermercados",
+        "url_busca": "https://www.economizesuper.com.br/busca?q={produto}",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'ean=(\d{8,14})',
         "categorias": {},
         "usar_google_search": True,
     },
-    "mercantil": {
-        "nome": "Mercantil Rodrigues",
-        "url_busca": "https://www.mercantilrodrigues.com.br/busca?q={produto}",
+    "horizonte": {
+        "nome": "Rede Horizonte",
+        "url_busca": "https://www.redehorizonte.com.br/busca?q={produto}",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'ean=(\d{8,14})',
         "categorias": {},
         "usar_google_search": True,
     },
-    "bigbompreco": {
-        "nome": "Big Bompreco",
-        "url_busca": "https://www.bigbompreco.com.br/busca?q={produto}",
+    "megabom": {
+        "nome": "Mega Economia",
+        "url_busca": "https://www.megaeconomia.com.br/busca?q={produto}",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'ean=(\d{8,14})',
         "categorias": {},
         "usar_google_search": True,
     },
-    "atakarejo": {
-        "nome": "Atakarejo",
-        "url_busca": "https://www.atakarejo.com.br/busca?q={produto}",
+    "litoral": {
+        "nome": "Atacarejo Litoral",
+        "url_busca": "https://www.atacarejolitoral.com.br/busca?q={produto}",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'ean=(\d{8,14})',
         "categorias": {},
         "usar_google_search": True,
     },
-    "pinheiro": {
-        "nome": "Pinheiro Supermercados",
-        "url_busca": "https://www.superpinheiro.com.br/busca?q={produto}",
+    "cedro": {
+        "nome": "Cedro Supermercados",
+        "url_busca": "https://www.supercedro.com.br/busca?q={produto}",
         "codificador": quote_plus,
         "expressao_regular_ean_url": r'ean=(\d{8,14})',
         "categorias": {},
@@ -1238,17 +1424,17 @@ CABECALHOS_REQUISICAO = {
 }
 
 DOMINIOS_CONCORRENTES = {
-    "dinizsupermercados.com.br":    "diniz",
-    "loja oestessaoluiz.com.br":    "saoluiz",
-    "atacadao.com.br":              "atacadao",
-    "assai.com.br":                 "assai",
-    "carrefour.com.br":             "carrefour",
-    "cometasupermercados.com.br":   "cometa",
-    "bomprecoce.com.br":            "bomprece",
-    "mercantilrodrigues.com.br":    "mercantil",
-    "bigbompreco.com.br":           "bigbompreco",
-    "atakarejo.com.br":             "atakarejo",
-    "superpinheiro.com.br":         "pinheiro",
+    "superaurora.com.br":    "aurora",
+    "mercadinhosvizinho.com.br":    "vizinho",
+    "atacadouno.com.br":              "atacauno",
+    "atacadodois.com.br":                 "atacadois",
+    "redecontinental.com.br":             "continental",
+    "estrelasupermercados.com.br":   "estrela",
+    "economizesuper.com.br":            "economize",
+    "redehorizonte.com.br":    "horizonte",
+    "megaeconomia.com.br":           "megabom",
+    "atacarejolitoral.com.br":             "litoral",
+    "supercedro.com.br":         "cedro",
 }
 
 # Regexes pre-compiladas para evitar problemas de aspas em raw strings
@@ -1367,7 +1553,7 @@ def raspar_todos_paralelo(
     Retorna lista de resultados deduplicados.
     """
     concorrentes = {
-        k: v for k, v in CONCORRENTES.items()
+        k: v for k, v in _mapa_lojas_completo().items()
         if not lojas_selecionadas or k in lojas_selecionadas
     }
     todos_resultados = []
@@ -1414,34 +1600,34 @@ def raspar_todos_paralelo(
 # ==========================================
 def buscar_encartes_todos(pagina, contexto, lojas_filtro=None) -> list:
     """
-    Busca encartes de todas as redes via Google, alem do Sao Luiz que tem pagina propria.
+    Busca encartes de todas as redes via Google, alem do Vizinho que tem pagina propria.
     """
     todos = []
     lojas_encarte = [
-        ("saoluiz",     "loja oestes Sao Luiz",  None),
-        ("atacadao",    "Atacadao",               "atacadao.com.br"),
-        ("assai",       "Assai Atacadista",        "assai.com.br"),
-        ("carrefour",   "Carrefour",              "carrefour.com.br"),
-        ("diniz",       "Diniz",                  "dinizsupermercados.com.br"),
-        ("cometa",      "Cometa",                 "cometasupermercados.com.br"),
-        ("bomprece",    "Bom Preco",              "bomprecoce.com.br"),
-        ("mercantil",   "Mercantil Rodrigues",     "mercantilrodrigues.com.br"),
-        ("bigbompreco", "Big Bompreco",            "bigbompreco.com.br"),
-        ("atakarejo",   "Atakarejo",              "atakarejo.com.br"),
-        ("pinheiro",    "Pinheiro",               "superpinheiro.com.br"),
+        ("vizinho",     "Mercadinhos Vizinho",  None),
+        ("atacauno",    "Atacado Uno",               "atacadouno.com.br"),
+        ("atacadois",       "Atacado Dois",        "atacadodois.com.br"),
+        ("continental",   "Rede Continental",              "redecontinental.com.br"),
+        ("aurora",       "Aurora",                  "superaurora.com.br"),
+        ("estrela",      "Estrela",                 "estrelasupermercados.com.br"),
+        ("economize",    "Economize",              "economizesuper.com.br"),
+        ("horizonte",   "Rede Horizonte",     "redehorizonte.com.br"),
+        ("megabom", "Mega Economia",            "megaeconomia.com.br"),
+        ("litoral",   "Atacarejo Litoral",              "atacarejolitoral.com.br"),
+        ("cedro",    "Cedro",               "supercedro.com.br"),
     ]
     if lojas_filtro:
         lojas_encarte = [(c, n, d) for c, n, d in lojas_encarte if c in lojas_filtro]
 
     for chave, nome, dominio in lojas_encarte:
         print(f"\n{Fore.CYAN}[Encarte] Buscando encarte de {nome}...{Style.RESET_ALL}")
-        # Sao Luiz: metodo proprio
-        if chave == "saoluiz":
-            res_sl = buscar_encartes_saoluiz(pagina, contexto)
+        # Vizinho: metodo proprio
+        if chave == "vizinho":
+            res_sl = buscar_encartes_vizinho(pagina, contexto)
             todos.extend(res_sl)
             continue
         # Outras: Google
-        query = f"encarte {nome} Fortaleza Ceara preco"
+        query = f"encarte {nome} Fortaleza regiao preco"
         try:
             pagina.goto("https://www.google.com.br", timeout=15000)
             campo = pagina.locator('input[name="q"], textarea[name="q"]').first
@@ -1601,8 +1787,8 @@ def buscar_ean_profundo(url_produto, contexto_playwright):
 # ==========================================
 def _raspar_vtex_generico(produto: str, chave: str, configuracao: dict) -> list:
     """
-    Raspa lojas VTEX genericas (Assai, Carrefour, etc.) usando a URL
-    vtex_api definida em CONCORRENTES. Reutiliza a mesma logica do Atacadao.
+    Raspa lojas VTEX genericas (Atacado Dois, Rede Continental, etc.) usando a URL
+    vtex_api definida em CONCORRENTES. Reutiliza a mesma logica do Atacado Uno.
     """
     vtex_url_template = configuracao.get("vtex_api", "")
     if not vtex_url_template:
@@ -1660,8 +1846,8 @@ def _raspar_vtex_generico(produto: str, chave: str, configuracao: dict) -> list:
     return resultados
 
 
-def _parse_item_vtex_atacadao(item: dict):
-    """Converte um item da VTEX API do Atacadao no formato interno (ou None)."""
+def _parse_item_vtex_atacauno(item: dict):
+    """Converte um item da VTEX API do Atacado Uno no formato interno (ou None)."""
     nome = item.get("productName") or item.get("name") or "—"
     ean, metodo_ean = "—", "—"
     for campo in ["EAN", "ean", "gtin"]:
@@ -1676,9 +1862,13 @@ def _parse_item_vtex_atacadao(item: dict):
                 ean, metodo_ean = v, "Nivel 5.4 (VTEX API SKU)"
                 break
     preco_normal, preco_oferta = "—", "—"
+    sku_id, seller_id = None, "1"
     try:
-        sellers = item.get("items", [{}])[0].get("sellers", [{}])
+        item0 = item.get("items", [{}])[0]
+        sku_id = item0.get("itemId")
+        sellers = item0.get("sellers", [{}])
         if sellers:
+            seller_id = sellers[0].get("sellerId") or "1"
             oferta = sellers[0].get("commertialOffer", {})
             por = oferta.get("Price")
             de = oferta.get("ListPrice")
@@ -1693,24 +1883,94 @@ def _parse_item_vtex_atacadao(item: dict):
         return None
     return {
         "produto_encontrado": nome, "preco_normal": preco_normal,
-        "preco_oferta": preco_oferta, "url": f"https://www.atacadao.com.br/{item.get('linkText', '')}/p",
-        "ean": ean, "metodo_ean": metodo_ean, "supermercado": "Atacadao",
+        "preco_oferta": preco_oferta, "url": f"https://www.atacadouno.com.br/{item.get('linkText', '')}/p",
+        "ean": ean, "metodo_ean": metodo_ean, "supermercado": "Atacado Uno",
+        "_sku": sku_id, "_seller": seller_id,
     }
 
 
-def raspar_atacadao_api(produto: str, limite=None) -> list:
-    """VTEX API do Atacadao paginada em blocos de 10 (gentil, evita rate-limit)."""
+# CEP FIXO da regiao do usuario (cidade-exemplo/CE). O Atacado Uno e
+# regionalizado: preco e disponibilidade dependem da regiao. Fixando o CEP,
+# a busca traz os produtos e precos CERTOS da regiao (via regionId da VTEX).
+ATACAUNO_CEP = "63010010"
+_atacauno_region_cache = {}
+
+
+def _atacauno_region_id(cep: str = None) -> str:
+    """Resolve o regionId da VTEX a partir do CEP (com cache)."""
+    cep = re.sub(r'\D', '', cep or ATACAUNO_CEP) or ATACAUNO_CEP
+    if cep in _atacauno_region_cache:
+        return _atacauno_region_cache[cep]
+    rid = ""
+    try:
+        u = f"https://www.atacadouno.com.br/api/checkout/pub/regions?country=BRA&postalCode={cep}"
+        resp = _get_com_retry(u, headers={**CABECALHOS_REQUISICAO, 'Accept': 'application/json'}, timeout=10)
+        if resp and resp.status_code == 200:
+            d = resp.json()
+            if isinstance(d, list) and d:
+                rid = d[0].get("id") or ""
+    except Exception as e:
+        logger.debug("atacauno region: %s", e)
+    _atacauno_region_cache[cep] = rid
+    return rid
+
+
+def _atacauno_simular_fardo(sku, seller, cep=None, qty=10):
+    """Simula a compra de N unidades na regiao (checkout VTEX) para obter o
+    PRECO DE FARDO (o que o site destaca, ex.: 'a partir de 10 unid'). Retorna
+    o preco unitario no fardo (float) ou None. Validado: bate com o site."""
+    if not sku:
+        return None
+    cep = re.sub(r'\D', '', cep or ATACAUNO_CEP)
+    try:
+        body = json.dumps({"items": [{"id": str(sku), "quantity": qty, "seller": str(seller or "1")}],
+                           "country": "BRA", "postalCode": cep})
+        r = requests.post(
+            "https://www.atacadouno.com.br/api/checkout/pub/orderForms/simulation?sc=1",
+            headers={**CABECALHOS_REQUISICAO, 'Accept': 'application/json',
+                     'Content-Type': 'application/json', 'Referer': 'https://www.atacadouno.com.br/'},
+            data=body, timeout=10)
+        if r.status_code == 200:
+            its = r.json().get("items", [])
+            if its and its[0].get("sellingPrice"):
+                return its[0]["sellingPrice"] / 100.0
+    except Exception as e:
+        logger.debug("atacauno simulacao fardo: %s", e)
+    return None
+
+
+def raspar_atacauno_api(produto: str, limite=None) -> list:
+    """Busca do Atacado Uno via VTEX INTELLIGENT SEARCH, JA NA REGIAO do usuario
+    (regionId do CEP fixo). Traz os produtos DISPONIVEIS da regiao, todos com
+    EAN, oferta e preco corretos — "fuzzy" (entende 'arroz 1kg').
+
+    PAGINACAO COMPLETA (v6.1): le o total real informado pela propria API
+    (campo 'recordsFiltered') na 1a pagina e percorre TODAS as paginas ate o
+    fim — parando so quando a pagina volta vazia, vem incompleta (< COUNT) ou
+    o total ja foi coletado. 'page' e 1-INDEXADO; 'count' = itens por pagina.
+    Antes o codigo travava em 11 paginas (range(1,12)) e perdia o restante."""
+    COUNT = 50
+    TETO_PAGINAS = 100          # seguranca (ate ~5000 itens) contra loop infinito
     resultados = []
-    cabecalhos = {**CABECALHOS_REQUISICAO, 'Accept': 'application/json', 'Referer': 'https://www.atacadao.com.br/'}
+    vistos = set()              # dedup por id do produto entre paginas
+    cabecalhos = {**CABECALHOS_REQUISICAO, 'Accept': 'application/json', 'Referer': 'https://www.atacadouno.com.br/'}
     q = quote_plus(produto)
-    n_paginas = min(max(1, _limite_efetivo(limite) // 10), 20)
-    for pagina_i in range(n_paginas):
-        a = pagina_i * 10
-        url = f"https://www.atacadao.com.br/api/catalog_system/pub/products/search/{q}?_from={a}&_to={a + 9}"
+    alvo = _limite_efetivo(limite)
+    rid = _atacauno_region_id()
+    sufixo_regiao = f"&regionId={rid}" if rid else ""
+    total_registros = None      # preenchido na 1a resposta (recordsFiltered)
+    max_paginas = TETO_PAGINAS
+    page = 1
+    while page <= max_paginas:  # Intelligent Search pagina a partir de 1
+        if len(resultados) >= alvo:
+            break
+        # SEM a barra antes do '?' -> evita o redirect 308 do endpoint a cada chamada.
+        url = (f"https://www.atacadouno.com.br/api/io/_v/api/intelligent-search/"
+               f"product_search?query={q}&count={COUNT}&page={page}{sufixo_regiao}")
         try:
-            resp = _get_com_retry(url, headers=cabecalhos, timeout=10)
+            resp = _get_com_retry(url, headers=cabecalhos, timeout=12)
         except Exception as e:
-            logger.debug("raspar_atacadao_api: %s", e)
+            logger.debug("raspar_atacauno_api (IS) pagina %d: %s", page, e)
             break
         if not (resp and resp.status_code in (200, 206)):
             break
@@ -1718,25 +1978,118 @@ def raspar_atacadao_api(produto: str, limite=None) -> list:
             dados = resp.json()
         except Exception:
             break
-        if not isinstance(dados, list) or not dados:
+        if not isinstance(dados, dict):
             break
-        for item in dados:
-            parsed = _parse_item_vtex_atacadao(item)
+        # Na 1a pagina, descobre o TOTAL real e ajusta quantas paginas percorrer.
+        if total_registros is None:
+            try:
+                total_registros = int(dados.get("recordsFiltered") or 0)
+            except (TypeError, ValueError):
+                total_registros = 0
+            if total_registros > 0:
+                paginas_necessarias = (total_registros + COUNT - 1) // COUNT
+                max_paginas = min(TETO_PAGINAS, paginas_necessarias)
+                logger.info("Atacado Uno '%s': %d itens no total (~%d paginas).",
+                            produto, total_registros, paginas_necessarias)
+        prods = dados.get("products", []) or []
+        if not prods:
+            break
+        for item in prods:
+            pid = item.get("productId") or item.get("linkText")
+            if pid is not None and pid in vistos:
+                continue
+            if pid is not None:
+                vistos.add(pid)
+            parsed = _parse_item_vtex_atacauno(item)
             if parsed:
                 resultados.append(parsed)
-        if len(dados) < 10:
+        if len(prods) < COUNT:  # ultima pagina (veio incompleta) -> acabou
             break
-        time.sleep(0.4)
+        page += 1
+        time.sleep(0.3)
+
+    # Preco de FARDO (10+ unid) via simulacao de checkout na regiao, em paralelo.
+    # O preco unitario (Price) fica como "normal"; o de fardo vira "oferta".
+    def _por_fardo(r):
+        fardo = _atacauno_simular_fardo(r.get("_sku"), r.get("_seller"))
+        unit = _preco_num(r.get("preco_normal"))
+        if fardo and unit and fardo < unit - 0.001:
+            r["preco_oferta"] = _fmt_preco(fardo)
+        return r
+    if resultados:
+        try:
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(_por_fardo, resultados))
+        except Exception as e:
+            logger.debug("atacauno fardo paralelo: %s", e)
+    for r in resultados:
+        r.pop("_sku", None)
+        r.pop("_seller", None)
     return resultados
 
 
+def _norm_nome(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r'[^a-z0-9 ]+', ' ', s.lower())  # tira pontuacao (hifen, ponto...)
+    return " ".join(s.split())
+
+
+def _termo_amplo(produto: str) -> str:
+    """Remove qualificadores de tamanho para AMPLIAR o mapa de EAN — a busca
+    da Intelligent Search por 'arroz 1kg' exclui os 5kg, mas por 'arroz' inclui
+    todos os tamanhos (que o site tambem devolve na busca 'arroz 1kg')."""
+    t = re.sub(r'\b\d+[\.,]?\d*\s*(kg|kgs|g|gr|l|lt|ml|un|litros?|gramas?|kilos?)\b',
+               ' ', (produto or '').lower())
+    t = " ".join(t.split())
+    return t or produto
+
+
+def _atacauno_mapa_ean(produto: str) -> dict:
+    """Mapa {nome_normalizado: EAN} da Intelligent Search do Atacado Uno.
+    Usa TODOS os produtos (ate esgotados) porque o EAN independe de estoque.
+    Serve para enriquecer com codigo de barras a lista do site (DOM)."""
+    mapa = {}
+    cab = {**CABECALHOS_REQUISICAO, 'Accept': 'application/json', 'Referer': 'https://www.atacadouno.com.br/'}
+    q = quote_plus(produto)
+    for page in range(1, 8):
+        url = (f"https://www.atacadouno.com.br/api/io/_v/api/intelligent-search/"
+               f"product_search/?query={q}&count=50&page={page}")
+        try:
+            resp = _get_com_retry(url, headers=cab, timeout=12)
+        except Exception:
+            break
+        if not (resp and resp.status_code in (200, 206)):
+            break
+        try:
+            prods = resp.json().get("products", [])
+        except Exception:
+            break
+        if not prods:
+            break
+        for p in prods:
+            nome = p.get("productName") or ""
+            ean = ""
+            for sku in p.get("items", []):
+                v = str(sku.get("ean") or "").strip()
+                if validar_ean(v):
+                    ean = v
+                    break
+            if nome and ean:
+                mapa[_norm_nome(nome)] = ean
+        if len(prods) < 50:
+            break
+        time.sleep(0.2)
+    return mapa
+
+
 # ==========================================
-# RASPAGEM DINIZ VIA API JSON
+# RASPAGEM AURORA VIA API JSON
 # ==========================================
-def raspar_diniz_api(produto: str, pagina, contexto) -> list:
+def raspar_aurora_api(produto: str, pagina, contexto) -> list:
     resultados_api = []
-    loja = "Diniz Supermercados"
-    url_busca = f"https://www.dinizsupermercados.com.br/busca?termo={quote(produto)}"
+    loja = "Aurora Supermercados"
+    url_busca = f"https://www.superaurora.com.br/busca?termo={quote(produto)}"
 
     def interceptar(resp_rede):
         if "application/json" not in resp_rede.headers.get("content-type", ""):
@@ -1773,7 +2126,7 @@ def raspar_diniz_api(produto: str, pagina, contexto) -> list:
                 for campo in ["ean", "EAN", "gtin", "barcode", "codigo_barras", "sku", "referenceId"]:
                     val = str(item.get(campo) or "").strip()
                     if validar_ean(val):
-                        ean, metodo_ean = val, "Nivel 5.5 (Diniz API JSON)"
+                        ean, metodo_ean = val, "Nivel 5.5 (Aurora API JSON)"
                         break
                 preco_normal, preco_oferta = "—", "—"
                 for campo_preco in ["price", "preco", "valor", "Price", "salePrice", "listPrice"]:
@@ -1792,7 +2145,7 @@ def raspar_diniz_api(produto: str, pagina, contexto) -> list:
                     "ean": ean, "metodo_ean": metodo_ean, "supermercado": loja,
                 })
         except Exception as e:
-            logger.debug("raspar_diniz_api interceptar: %s", e)
+            logger.debug("raspar_aurora_api interceptar: %s", e)
 
     pagina.on("response", interceptar)
     try:
@@ -1813,9 +2166,9 @@ def raspar_diniz_api(produto: str, pagina, contexto) -> list:
 # Limite generoso por loja (o usuario quer "dezenas e centenas" de produtos).
 CAP_POR_LOJA = 150
 
-# Sao Luiz roda na plataforma Mercadapp: cada card e um div.card-product com
+# Vizinho roda na plataforma Mercadapp: cada card e um div.card-product com
 # .current-price-product (preco atual) e .offer-price (preco antigo riscado).
-_JS_CARDS_SAOLUIZ = r"""
+_JS_CARDS_VIZINHO = r"""
 () => {
   const cards = Array.from(document.querySelectorAll('div.card-product'));
   return cards.map(c => {
@@ -1835,9 +2188,9 @@ _JS_CARDS_SAOLUIZ = r"""
 }
 """
 
-# Diniz roda na plataforma VipCommerce (Angular): card .vip-card-produto,
+# Aurora roda na plataforma VipCommerce (Angular): card .vip-card-produto,
 # nome em [data-cy="produto-descricao"] e preco em <vip-produto-preco>.
-_JS_CARDS_DINIZ = r"""
+_JS_CARDS_AURORA = r"""
 () => {
   const cards = Array.from(document.querySelectorAll('.vip-card-produto'));
   return cards.map(c => {
@@ -1867,9 +2220,9 @@ def _fmt_preco(v: float) -> str:
     return f"R$ {v:.2f}".replace('.', ',')
 
 
-# Atacadao (pagina de busca VTEX IO): card em section[data-testid="store-product-card-content"],
+# Atacado Uno (pagina de busca VTEX IO): card em section[data-testid="store-product-card-content"],
 # nome no h3[title], preco no texto do card.
-_JS_CARDS_ATACADAO = r"""
+_JS_CARDS_ATACAUNO = r"""
 () => {
   const cards = Array.from(document.querySelectorAll('[data-testid="store-product-card-content"], section[data-product-card-content="true"]'));
   return cards.map(c => {
@@ -1955,87 +2308,168 @@ def _navegar_e_coletar(pagina, js: str, seletor_espera: str, limite=None,
     return itens[:alvo] if alvo < 100000 else itens
 
 
-def raspar_saoluiz_dom(produto: str, pagina, url_busca: str, limite=None, tempo_max=55) -> list:
-    """Lista completa do loja oestes Sao Luiz (Mercadapp), clicando 'Ver Mais'."""
-    loja = "loja oestes Sao Luiz"
+def raspar_vizinho_dom(produto: str, pagina, url_busca: str, limite=None, tempo_max=55) -> list:
+    """Lista completa do Mercadinhos Vizinho (Mercadapp).
+    A API interna (merconnect) exige um Bearer token que o app gera. Entao:
+    abro a pagina (autentica), CAPTURO o token do request items/search e paginо
+    a API direto (page + has_next_page). Traz EAN, preco e oferta de TODAS as
+    paginas — bem mais completo/limpo do que ler os cards da tela."""
+    loja = "Mercadinhos Vizinho"
+    alvo = _limite_efetivo(limite)
+    m = re.search(r'/loja/(\d+)', url_busca)
+    market = m.group(1) if m else "369"
+    token = {"v": None}
+
+    def _cap_token(req):
+        try:
+            if "items/search" in req.url and not token["v"]:
+                t = req.headers.get("authorization")
+                if t:
+                    token["v"] = t
+        except Exception:
+            pass
+
+    pagina.on("request", _cap_token)
     try:
         pagina.goto(url_busca, timeout=40000, wait_until="domcontentloaded")
+        pagina.wait_for_selector("div.card-product", timeout=15000)
     except Exception as e:
-        logger.debug("saoluiz goto: %s", e)
+        logger.debug("vizinho goto: %s", e)
+    pagina.wait_for_timeout(800)
+    try:
+        pagina.remove_listener("request", _cap_token)
+    except Exception:
+        pass
+
+    # Sem token: cai para a IA ler a pagina (raro).
+    if not token["v"]:
+        res = _fallback_ia_extrair(pagina, produto, loja)
+        res = ordenar_por_relevancia(produto, res)
+        return res[:alvo] if alvo < 100000 else res
+
+    headers = {**CABECALHOS_REQUISICAO, "Accept": "application/json",
+               "Authorization": token["v"], "Origin": "https://mercadinhosvizinho.com.br",
+               "Referer": "https://mercadinhosvizinho.com.br/"}
+    q = quote_plus(produto)
+    coletados = {}
+    for page in range(1, 60):
+        if len(coletados) >= alvo:
+            break
+        url = (f"https://merconnect.mercadapp.com.br/mapp/v3/markets/{market}"
+               f"/items/search?page={page}&query={q}")
+        try:
+            resp = _get_com_retry(url, headers=headers, timeout=12)
+        except Exception as e:
+            logger.debug("vizinho api: %s", e)
+            break
+        if not (resp and resp.status_code == 200):
+            break
+        try:
+            dados = resp.json()
+        except Exception:
+            break
+        for mix in dados.get("mixes", []):
+            for it in mix.get("items", []):
+                pid = it.get("id") or it.get("product_id")
+                if pid is not None:
+                    coletados[pid] = it
+        if not dados.get("has_next_page"):
+            break
+        time.sleep(0.2)
+
     resultados = []
-    brutos = _navegar_e_coletar(pagina, _JS_CARDS_SAOLUIZ, "div.card-product",
-                                limite, ver_mais_textos=["Ver Mais", "Ver mais"],
-                                tempo_max_seg=tempo_max)
-    for it in brutos:
-        atual = _precos_do_texto(it.get("atual", ""))
-        antigo = _precos_do_texto(it.get("antigo", ""))
-        if not atual:
+    for it in coletados.values():
+        nome = (it.get("description") or "").strip()
+        if not nome:
             continue
-        if antigo:
-            preco_normal, preco_oferta = _fmt_preco(antigo[0]), _fmt_preco(atual[0])
+        try:
+            por = float(it.get("price") or 0)
+        except Exception:
+            por = 0.0
+        try:
+            de = float(it.get("original_price") or 0)
+        except Exception:
+            de = 0.0
+        if por <= 0:
+            continue
+        if it.get("is_offer") and de > por:
+            preco_normal, preco_oferta = _fmt_preco(de), _fmt_preco(por)
         else:
-            preco_normal, preco_oferta = _fmt_preco(atual[0]), "—"
-        url = it.get("url", "") or url_busca
-        if url.startswith("/"):
-            url = "https://loja oestessaoluiz.com.br" + url
+            preco_normal, preco_oferta = _fmt_preco(por), "—"
+        ean = str(it.get("bar_code") or "").strip()
+        ean_ok = ean if validar_ean(ean) else "—"
+        slug = it.get("slug") or ""
+        url_p = (f"https://mercadinhosvizinho.com.br/loja/{market}/produto/{slug}"
+                 if slug else url_busca)
         resultados.append({
-            "produto_encontrado": it["nome"], "preco_normal": preco_normal,
-            "preco_oferta": preco_oferta, "url": url,
-            "ean": "—", "metodo_ean": "—", "supermercado": loja,
+            "produto_encontrado": nome, "preco_normal": preco_normal,
+            "preco_oferta": preco_oferta, "url": url_p,
+            "ean": ean_ok, "metodo_ean": ("Mercadapp API" if ean_ok != "—" else "—"),
+            "supermercado": loja,
         })
-    return resultados
+    return resultados[:alvo] if alvo < 100000 else resultados
 
 
-def raspar_diniz_dom(produto: str, pagina, url_busca: str, limite=None, tempo_max=55) -> list:
-    """Lista completa do Diniz (VipCommerce). Rola como pessoa para carregar as
-    proximas paginas e INTERCEPTA a API JSON de busca (dados limpos + EAN)."""
-    loja = "Diniz Supermercados"
+def raspar_aurora_dom(produto: str, pagina, url_busca: str, limite=None, tempo_max=55) -> list:
+    """Lista completa do Aurora (VipCommerce). CAPTURA a autenticacao (token +
+    headers: domainkey, organizationid) da API interna e PAGINA DIRETO
+    (page.request), trazendo TODOS os produtos de forma CONFIAVEL — sem depender
+    de rolagem (que dava resultado instavel: 99/79/0). Traz EAN, preco e oferta."""
+    loja = "Aurora Supermercados"
     alvo = _limite_efetivo(limite)
     coletados = {}  # produto_id -> dict bruto (dedup por id)
+    cap = {"base": None, "headers": None, "session": ""}
 
-    def on_resp(resp):
-        try:
-            if "buscas/produtos/termo" not in resp.url:
-                return
-            if "application/json" not in resp.headers.get("content-type", ""):
-                return
-            data = ((resp.json() or {}).get("data") or {})
-            for p in data.get("produtos", []) or []:
-                pid = p.get("produto_id") or p.get("id")
-                if pid is not None:
-                    coletados[pid] = p
-        except Exception as e:
-            logger.debug("diniz on_resp: %s", e)
+    def _capturar(req):
+        if "buscas/produtos/termo" in req.url and cap["base"] is None:
+            try:
+                pu = urlparse(req.url)
+                cap["base"] = f"{pu.scheme}://{pu.netloc}{pu.path}"
+                cap["session"] = parse_qs(pu.query).get("session", [""])[0]
+                cap["headers"] = {k: v for k, v in req.headers.items()
+                                  if k.lower() not in ("host", "content-length")}
+            except Exception as e:
+                logger.debug("aurora cap: %s", e)
 
-    pagina.on("response", on_resp)
+    pagina.on("request", _capturar)
     try:
         pagina.goto(url_busca, timeout=40000, wait_until="domcontentloaded")
         pagina.wait_for_selector(".vip-card-produto", timeout=15000)
     except Exception as e:
-        logger.debug("diniz goto: %s", e)
-    # Rola de verdade (End + wheel) para o app buscar as proximas paginas.
-    inicio, estavel, anterior = time.time(), 0, -1
-    while (time.time() - inicio) < tempo_max:
-        n = len(coletados)
-        if n >= alvo:
-            break
-        if n == anterior:
-            estavel += 1
-            if estavel >= 4:
-                break
-        else:
-            estavel = 0
-        anterior = n
-        try:
-            pagina.keyboard.press("End")
-            pagina.mouse.wheel(0, 3000)
-        except Exception:
-            pass
-        pagina.wait_for_timeout(900)
+        logger.debug("aurora goto: %s", e)
+    pagina.wait_for_timeout(600)
     try:
-        pagina.remove_listener("response", on_resp)
+        pagina.remove_listener("request", _capturar)
     except Exception:
         pass
+
+    # Pagina a API interna DIRETO com a auth capturada — traz TODAS as paginas.
+    if cap["base"] and cap["headers"]:
+        inicio = time.time()
+        for page in range(1, 200):
+            if len(coletados) >= alvo or (time.time() - inicio) > tempo_max:
+                break
+            url_api = f"{cap['base']}?page={page}&session={cap['session']}"
+            try:
+                r = pagina.request.get(url_api, headers=cap["headers"], timeout=15000)
+            except Exception as e:
+                logger.debug("aurora page.request: %s", e)
+                break
+            if r.status != 200:
+                break
+            try:
+                dados = r.json()
+            except Exception:
+                break
+            prods = (dados.get("data") or {}).get("produtos", []) or []
+            if not prods:
+                break
+            for p in prods:
+                pid = p.get("produto_id") or p.get("id")
+                if pid is not None:
+                    coletados[pid] = p
+            if len(prods) < 20:
+                break
 
     resultados = []
     for p in coletados.values():
@@ -2059,7 +2493,7 @@ def raspar_diniz_dom(produto: str, pagina, url_busca: str, limite=None, tempo_ma
         ean = str(p.get("codigo_barras") or "").strip()
         ean_ok = ean if validar_ean(ean) else "—"
         slug = p.get("link") or ""
-        url = (f"https://www.dinizsupermercados.com.br/produto/{p.get('produto_id')}/{slug}"
+        url = (f"https://www.superaurora.com.br/produto/{p.get('produto_id')}/{slug}"
                if slug else url_busca)
         resultados.append({
             "produto_encontrado": nome, "preco_normal": preco_normal,
@@ -2070,42 +2504,75 @@ def raspar_diniz_dom(produto: str, pagina, url_busca: str, limite=None, tempo_ma
     return resultados[:alvo] if alvo < 100000 else resultados
 
 
-def raspar_atacadao_dom(produto: str, pagina, limite=None, tempo_max=55) -> list:
-    """Fallback do Atacadao: navega a pagina de busca e le os cards do DOM
+def raspar_atacauno_dom(produto: str, pagina, limite=None, tempo_max=55) -> list:
+    """Fallback do Atacado Uno: navega a pagina de busca e le os cards do DOM
     (usado quando a API VTEX bloqueia/retorna 400/403)."""
-    loja = "Atacadao"
-    url = f"https://www.atacadao.com.br/s?q={quote_plus(produto)}&sort=score_desc&page=0"
-    try:
-        pagina.goto(url, timeout=40000, wait_until="domcontentloaded")
-    except Exception as e:
-        logger.debug("atacadao dom goto: %s", e)
-    for txt in ("Aceitar", "Prosseguir", "Concordo"):
+    loja = "Atacado Uno"
+    alvo = _limite_efetivo(limite)
+    q = quote_plus(produto)
+    resultados = []
+    vistos = set()
+    inicio = time.time()
+    cookie_ok = False
+    # O site do Atacado Uno pagina por &page=N, 1-INDEXADO (pag.1 sem o parametro,
+    # pag.2 = &page=2, etc.), 20 por pagina. Percorre ate acabar (<20 numa
+    # pagina), atingir o limite ou o tempo.
+    for page in range(1, 16):
+        if len(resultados) >= alvo or (time.time() - inicio) > tempo_max:
+            break
+        url = f"https://www.atacadouno.com.br/s?q={q}&sort=score_desc&page={page}"
         try:
-            b = pagina.locator(f"button:has-text('{txt}')").first
-            if b.count() and b.is_visible():
-                b.click(timeout=2000)
-                break
+            pagina.goto(url, timeout=40000, wait_until="domcontentloaded")
+        except Exception as e:
+            logger.debug("atacauno dom goto: %s", e)
+        if not cookie_ok:
+            for txt in ("Aceitar", "Prosseguir", "Concordo"):
+                try:
+                    b = pagina.locator(f"button:has-text('{txt}')").first
+                    if b.count() and b.is_visible():
+                        b.click(timeout=2000)
+                        cookie_ok = True
+                        break
+                except Exception:
+                    pass
+        try:
+            pagina.wait_for_selector('[data-testid="store-product-card-content"]', timeout=12000)
         except Exception:
             pass
-    resultados = []
-    for it in _navegar_e_coletar(pagina, _JS_CARDS_ATACADAO,
-                                 '[data-testid="store-product-card-content"]', limite,
-                                 tempo_max_seg=tempo_max):
-        precos = _precos_do_texto(it.get("precoTxt", ""))
-        if not precos:
-            continue
-        if len(precos) >= 2:
-            preco_normal, preco_oferta = _fmt_preco(max(precos)), _fmt_preco(min(precos))
-        else:
-            preco_normal, preco_oferta = _fmt_preco(precos[0]), "—"
-        url_p = it.get("url", "") or url
-        if url_p.startswith("/"):
-            url_p = "https://www.atacadao.com.br" + url_p
-        resultados.append({
-            "produto_encontrado": it["nome"], "preco_normal": preco_normal,
-            "preco_oferta": preco_oferta, "url": url_p,
-            "ean": "—", "metodo_ean": "DOM (navegador)", "supermercado": loja,
-        })
+        pagina.wait_for_timeout(600)
+        try:
+            brutos = pagina.evaluate(_JS_CARDS_ATACAUNO) or []
+        except Exception:
+            brutos = []
+        if not brutos:
+            break
+        novos = 0
+        for it in brutos:
+            nome = it.get("nome", "")
+            kn = _norm_nome(nome)
+            if not nome or kn in vistos:
+                continue
+            precos = _precos_do_texto(it.get("precoTxt", ""))
+            if precos:
+                if len(precos) >= 2:
+                    preco_normal, preco_oferta = _fmt_preco(max(precos)), _fmt_preco(min(precos))
+                else:
+                    preco_normal, preco_oferta = _fmt_preco(precos[0]), "—"
+            else:
+                preco_normal, preco_oferta = "ESGOTADO", "—"  # traz o item mesmo sem preco
+            url_p = it.get("url", "") or url
+            if url_p.startswith("/"):
+                url_p = "https://www.atacadouno.com.br" + url_p
+            vistos.add(kn)
+            resultados.append({
+                "produto_encontrado": nome, "preco_normal": preco_normal,
+                "preco_oferta": preco_oferta, "url": url_p,
+                "ean": "—", "metodo_ean": "site (navegador)", "supermercado": loja,
+            })
+            novos += 1
+        if novos == 0 or len(brutos) < 20:
+            break
+        time.sleep(0.3)
     return resultados
 
 
@@ -2123,12 +2590,24 @@ def _fallback_ia_extrair(pagina, produto: str, loja: str) -> list:
     renderizado da pagina e extrai os produtos com preco."""
     if not _existe_alguma_ia():
         return []
-    try:
-        texto = (pagina.inner_text("body") or "")[:6000]
-    except Exception:
-        return []
+    # Espera a pagina (SPA) pintar conteudo com preco, rolando para carregar.
+    texto = ""
+    for _ in range(14):
+        try:
+            texto = pagina.evaluate("document.body ? document.body.innerText : ''") or ""
+        except Exception:
+            texto = ""
+        if "R$" in texto and len(texto) > 150:
+            break
+        try:
+            pagina.mouse.wheel(0, 2500)
+            pagina.keyboard.press("End")
+        except Exception:
+            pass
+        pagina.wait_for_timeout(900)
     if "R$" not in texto:
         return []
+    texto = texto[:6000]
     resp = ia_chat(
         [
             {"role": "system", "content": (
@@ -2307,9 +2786,9 @@ def _coletar_links_google(produto: str, pagina) -> list:
     if not links:
         print(f"   {Fore.YELLOW}Motores de busca bloquearam. Buscando diretamente nos sites...{Style.RESET_ALL}")
         urls_diretas = {
-            "diniz":    f"https://www.dinizsupermercados.com.br/busca?termo={quote(produto)}",
-            "saoluiz":  f"https://loja oestessaoluiz.com.br/loja/355?search={quote_plus(produto)}",
-            "atacadao": f"https://www.atacadao.com.br/s?q={quote_plus(produto)}",
+            "aurora":    f"https://www.superaurora.com.br/busca?termo={quote(produto)}",
+            "vizinho":  f"https://mercadinhosvizinho.com.br/loja/355?search={quote_plus(produto)}",
+            "atacauno": f"https://www.atacadouno.com.br/s?q={quote_plus(produto)}",
         }
         for url in urls_diretas.values():
             links.append(url)
@@ -2476,60 +2955,73 @@ def raspar_concorrente(produto: str, chave: str, configuracao: dict, pagina, con
     print(f"\n{Fore.CYAN}Varrendo catalogo de {loja}...{Style.RESET_ALL}")
     logger.info("Raspando '%s' em %s.", produto, loja)
 
-    # ── DISPATCH POR LOJA: navega como pessoa e traz a lista COMPLETA ────────
-    if chave == "diniz":
-        res = raspar_diniz_dom(produto, pagina, url_base, limite, tempo_max)
-        if not res:
-            print(f"   {Fore.YELLOW}Diniz: DOM vazio, tentando leitura por IA...{Style.RESET_ALL}")
-            res = _fallback_ia_extrair(pagina, produto, loja)
+    # ── Site CUSTOMIZADO (cadastrado pelo usuario): navega + IA le a pagina ──
+    if configuracao.get("customizado"):
+        try:
+            pagina.goto(url_base, timeout=40000, wait_until="domcontentloaded")
+        except Exception as e:
+            logger.debug("custom goto: %s", e)
+        res = _fallback_ia_extrair(pagina, produto, loja)  # ja espera a pagina pintar
         if res:
             res = ordenar_por_relevancia(produto, res)
-            print(f"   {Fore.GREEN}Diniz: {len(res)} produto(s).{Style.RESET_ALL}")
-            return res
-        return []
-
-    if chave == "saoluiz":
-        res = raspar_saoluiz_dom(produto, pagina, url_base, limite, tempo_max)
-        if not res:
-            print(f"   {Fore.YELLOW}Sao Luiz: DOM vazio, tentando leitura por IA...{Style.RESET_ALL}")
-            res = _fallback_ia_extrair(pagina, produto, loja)
-        if res:
-            res = ordenar_por_relevancia(produto, res)
-            print(f"   {Fore.GREEN}Sao Luiz: {len(res)} produto(s).{Style.RESET_ALL}")
-            return res
-        return []
-
-    if chave == "atacadao":
-        # 1) API VTEX (rapida). 2) se bloquear/vier vazia, NAVEGA a pagina de
-        # busca e le o DOM. 3) se ainda vazio, a IA le a pagina. Fim do
-        # "as vezes vem, as vezes nao".
-        res = raspar_atacadao_api(produto, limite)
-        origem = "VTEX API"
-        if not res:
-            if callback_status:
-                callback_status("🚫 Atacadao: API bloqueou — abrindo no navegador...")
-            print(f"   {Fore.YELLOW}Atacadao: API vazia/bloqueada, indo pelo navegador...{Style.RESET_ALL}")
-            res = raspar_atacadao_dom(produto, pagina, limite, tempo_max)
-            origem = "navegador (DOM)"
-        if not res:
-            res = _fallback_ia_extrair(pagina, produto, loja)
-            origem = "IA (leitura da pagina)"
-        if res:
-            res = ordenar_por_relevancia(produto, res)
-            print(f"   {Fore.GREEN}Atacadao: {len(res)} produto(s) via {origem}.{Style.RESET_ALL}")
+            alvo = _limite_efetivo(limite)
+            res = res[:alvo] if alvo < 100000 else res
+            print(f"   {Fore.GREEN}{loja} (site cadastrado): {len(res)} produto(s) via IA.{Style.RESET_ALL}")
             return res
         if callback_status:
-            callback_status("⚠️ Atacadao: bloqueado (sem resultado)")
+            callback_status(f"⚠️ {loja}: nao consegui ler os produtos")
         return []
 
-    if chave == "assai":
-        # Assai (atacadao) nao tem loja online com precos: dados apenas via
+    # ── DISPATCH POR LOJA: navega como pessoa e traz a lista COMPLETA ────────
+    if chave == "aurora":
+        res = raspar_aurora_dom(produto, pagina, url_base, limite, tempo_max)
+        if not res:
+            print(f"   {Fore.YELLOW}Aurora: DOM vazio, tentando leitura por IA...{Style.RESET_ALL}")
+            res = _fallback_ia_extrair(pagina, produto, loja)
+        if res:
+            res = ordenar_por_relevancia(produto, res)
+            print(f"   {Fore.GREEN}Aurora: {len(res)} produto(s).{Style.RESET_ALL}")
+            return res
+        return []
+
+    if chave == "vizinho":
+        res = raspar_vizinho_dom(produto, pagina, url_base, limite, tempo_max)
+        if not res:
+            print(f"   {Fore.YELLOW}Vizinho: DOM vazio, tentando leitura por IA...{Style.RESET_ALL}")
+            res = _fallback_ia_extrair(pagina, produto, loja)
+        if res:
+            res = ordenar_por_relevancia(produto, res)
+            print(f"   {Fore.GREEN}Vizinho: {len(res)} produto(s).{Style.RESET_ALL}")
+            return res
+        return []
+
+    if chave == "atacauno":
+        # COBERTURA primeiro: a lista do site como o usuario ve (DOM). O EAN
+        # entra como PLUS, casado por nome com a Intelligent Search (que tem EAN
+        # ate de item esgotado). Se o site nao responder: usa a IS (disponiveis,
+        # ja com EAN); por fim, a IA le a pagina.
+        # CORRECAO/CRITERIO: NUNCA trazer preco errado. So a Intelligent Search
+        # com a REGIAO do usuario (CEP fixo cidade-exemplo) garante o preco CERTO da
+        # regiao + EAN. NAO usamos o navegador nem a IA aqui, porque sem a regiao
+        # correta eles pegam preco de OUTRA regiao (dado errado). Preferimos
+        # trazer so os disponiveis (com preco certo) a trazer preco errado.
+        res = raspar_atacauno_api(produto, limite)
+        if res:
+            res = ordenar_por_relevancia(produto, res)
+            print(f"   {Fore.GREEN}Atacado Uno: {len(res)} produto(s) via Intelligent Search (regiao).{Style.RESET_ALL}")
+            return res
+        if callback_status:
+            callback_status("⚠️ Atacado Uno: sem resultado na API da regiao")
+        return []
+
+    if chave == "atacadois":
+        # Atacado Dois (atacauno) nao tem loja online com precos: dados apenas via
         # Encartes (PDF) na aba propria. A busca online fica vazia de proposito.
-        logger.info("Assai: sem busca de produto online; use a aba Encartes.")
+        logger.info("Atacado Dois: sem busca de produto online; use a aba Encartes.")
         return []
 
-    # ── Carrefour e demais lojas VTEX: API generica ─────────────────────────
-    if chave == "carrefour":
+    # ── Rede Continental e demais lojas VTEX: API generica ─────────────────────────
+    if chave == "continental":
         res = _raspar_vtex_generico(produto, chave, configuracao)
         if res:
             filtrados = filtrar_e_ordenar_por_nlp(produto, res)
@@ -2556,7 +3048,7 @@ def raspar_concorrente(produto: str, chave: str, configuracao: dict, pagina, con
                     print(f"   {Fore.GREEN}Google Barra: {len(resultados_google)} produto(s) encontrado(s) em {loja}.{Style.RESET_ALL}")
                     return resultados_google[:6]
 
-    # ── Sao Luiz e fallback: Playwright ─────────────────────────────────────
+    # ── Vizinho e fallback: Playwright ─────────────────────────────────────
     resultados = []
     resultados_api_busca = []
 
@@ -2581,15 +3073,15 @@ def raspar_concorrente(produto: str, chave: str, configuracao: dict, pagina, con
                         else:
                             ean = "—"
                         slug = item.get("slug")
-                        url_prod = f"https://loja oestessaoluiz.com.br/produto/{slug}" if slug else url_base
+                        url_prod = f"https://mercadinhosvizinho.com.br/produto/{slug}" if slug else url_base
                         resultados_api_busca.append({
                             "produto_encontrado": nome, "preco_normal": preco_n, "preco_oferta": preco_o,
                             "url": url_prod, "ean": ean, "metodo_ean": metodo_ean, "supermercado": loja
                         })
             except Exception as e:
-                logger.debug("interceptar_busca saoluiz: %s", e)
+                logger.debug("interceptar_busca vizinho: %s", e)
 
-    if chave == "saoluiz":
+    if chave == "vizinho":
         pagina.on("response", interceptar_busca)
 
     try:
@@ -2598,7 +3090,7 @@ def raspar_concorrente(produto: str, chave: str, configuracao: dict, pagina, con
     except (PlaywrightTimeoutError, Exception):
         pass
 
-    if chave == "saoluiz":
+    if chave == "vizinho":
         try:
             pagina.remove_listener("response", interceptar_busca)
         except Exception:
@@ -2727,7 +3219,7 @@ def raspar_concorrente(produto: str, chave: str, configuracao: dict, pagina, con
 
     # ── Ultimo recurso: Google Barra + Screenshot OCR ────────────────────────
     # Se nao for loja com google_search (ja tentou acima) e nao for loja com API
-    if not configuracao.get("usar_google_search") and chave not in ("atacadao", "assai", "carrefour"):
+    if not configuracao.get("usar_google_search") and chave not in ("atacauno", "atacadois", "continental"):
         dominio = next((d for d, c in DOMINIOS_CONCORRENTES.items() if c == chave), "")
         if dominio:
             print(f"   {Fore.YELLOW}Playwright sem resultado. Tentando Google Barra...{Style.RESET_ALL}")
@@ -2856,11 +3348,11 @@ def raspar_categoria(url_categoria: str, chave: str, configuracao: dict, pagina,
 # ==========================================
 # ENCARTES PDF
 # ==========================================
-def buscar_encartes_saoluiz(pagina, contexto) -> list:
-    print(f"\n{Fore.CYAN}Buscando encartes do loja oestes Sao Luiz...{Style.RESET_ALL}")
+def buscar_encartes_vizinho(pagina, contexto) -> list:
+    print(f"\n{Fore.CYAN}Buscando encartes do Mercadinhos Vizinho...{Style.RESET_ALL}")
     resultados = []
     try:
-        pagina.goto("https://loja oestessaoluiz.com.br/loja/355", timeout=30000)
+        pagina.goto("https://mercadinhosvizinho.com.br/loja/355", timeout=30000)
         pagina.wait_for_load_state("networkidle", timeout=10000)
         btn = pagina.locator("text=Encartes").first
         if btn.count() == 0:
@@ -2882,7 +3374,7 @@ def buscar_encartes_saoluiz(pagina, contexto) -> list:
         print(f"   {Fore.GREEN}{len(links_pdf)} encarte(s) encontrado(s).{Style.RESET_ALL}")
         for url_pdf in links_pdf[:3]:
             if not url_pdf.startswith("http"):
-                url_pdf = "https://loja oestessaoluiz.com.br" + url_pdf
+                url_pdf = "https://mercadinhosvizinho.com.br" + url_pdf
             print(f"   Baixando: {url_pdf[:80]}...")
             try:
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
@@ -2896,7 +3388,7 @@ def buscar_encartes_saoluiz(pagina, contexto) -> list:
                                 nome = re.sub(r'R\$[\d.,\s]+', '', linha).strip()
                                 if nome and len(nome) > 4:
                                     resultados.append({
-                                        "supermercado": "Sao Luiz (Encarte PDF)", "produto_encontrado": nome[:80],
+                                        "supermercado": "Vizinho (Encarte PDF)", "produto_encontrado": nome[:80],
                                         "preco_normal": f"R$ {oc.group(1)}", "preco_oferta": "—",
                                         "ean": "—", "metodo_ean": "Encarte PDF", "url": url_pdf
                                     })
@@ -2906,7 +3398,7 @@ def buscar_encartes_saoluiz(pagina, contexto) -> list:
                 logger.error("Erro ao processar PDF %s: %s", url_pdf[:60], e)
     except Exception as e:
         print(f"   {Fore.RED}Erro: {str(e)[:80]}{Style.RESET_ALL}")
-        logger.error("buscar_encartes_saoluiz: %s", e)
+        logger.error("buscar_encartes_vizinho: %s", e)
     print(f"   {Fore.GREEN}{len(resultados)} produto(s) dos encartes.{Style.RESET_ALL}")
     return resultados
 
@@ -2975,9 +3467,9 @@ def main():
 
     status_ia = f"{Fore.GREEN}ativa (Multi-IA: GPT-4o, Gemini 1.5, Groq){Style.RESET_ALL}" if cliente_openai else f"{Fore.RED}desativada (sem OPENAI_API_KEY){Style.RESET_ALL}"
     print(f"\n{Fore.YELLOW}===================================================={Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}   Extrator de Precos e EAN - v4.0 (Edicao Ceara)   {Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}   Diniz | Sao Luiz | Atacadao | Assai | Carrefour {Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}   Cometa | Bom Preco | Mercantil | Pinheiro | +3   {Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}   Falcons Data v6.1 - Extrator de Precos e EAN     {Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}   Aurora | Vizinho | Atacado Uno | Atacado Dois | Rede Continental {Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}   Estrela | Economize | Horizonte | Cedro | +3   {Style.RESET_ALL}")
     print(f"{Fore.YELLOW}===================================================={Style.RESET_ALL}")
     print(f"{Fore.CYAN}Assistente Multi-IA: {status_ia}")
     print(f"{Fore.CYAN}Logs salvos em: {_log_filename}{Style.RESET_ALL}\n")
@@ -2991,7 +3483,7 @@ def main():
                 print(f"\n{Fore.YELLOW}O que deseja fazer?{Style.RESET_ALL}")
                 print("  1. Pesquisar produto por nome (catalogo dos sites)")
                 print("  2. Navegar por categoria/departamento")
-                print("  3. Ver encartes (PDF) — Sao Luiz")
+                print("  3. Ver encartes (PDF) — Vizinho")
                 print(f"  {Fore.GREEN}4. Buscar no Google e confrontar com concorrentes{Style.RESET_ALL}")
                 print("  0. Sair")
                 if cliente_openai:
@@ -3017,11 +3509,11 @@ def main():
                         produto_limpo = partes[0].strip()
                         dest = partes[1].strip()
                         if "luiz" in dest:
-                            conc_esp = "saoluiz"
-                        elif "atacadao" in dest or "atacad\u00e3o" in dest:
-                            conc_esp = "atacadao"
-                        elif "diniz" in dest:
-                            conc_esp = "diniz"
+                            conc_esp = "vizinho"
+                        elif "atacauno" in dest or "atacad\u00e3o" in dest:
+                            conc_esp = "atacauno"
+                        elif "aurora" in dest:
+                            conc_esp = "aurora"
 
                     produto_normalizado = ia_normalizar_entrada(produto_limpo)
                     if produto_normalizado.lower() != produto_limpo.lower():
@@ -3066,7 +3558,7 @@ def main():
                     _menu_categorias(pagina, ctx)
 
                 elif opcao == "3":
-                    resultados = buscar_encartes_saoluiz(pagina, ctx)
+                    resultados = buscar_encartes_vizinho(pagina, ctx)
                     _exibir_e_exportar(resultados)
 
                 elif opcao == "4":

@@ -1,6 +1,6 @@
 """
-app_gui.py — Interface Grafica Premium v5.0
-SuperPreco Ceara — Inteligencia de Mercado
+app_gui.py — Interface Grafica
+Falcons Data — Inteligencia de Mercado
 """
 
 import os
@@ -44,22 +44,23 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 # ── Paleta de Cores Premium ───────────────────────────────────────────────────
+# Paleta inspirada no print: charcoal escuro + coral/vermelho + branco/cinza.
 C = {
-    "bg":          "#0a0e1a",
-    "sidebar":     "#0d1224",
-    "card":        "#111827",
-    "card_hover":  "#1a2235",
-    "tile":        "#0f1729",
-    "border":      "#1e2d45",
-    "accent":      "#4f8ef7",
-    "accent_hi":   "#3a7af5",
-    "accent2":     "#1ed99e",
-    "accent3":     "#f7934f",
-    "danger":      "#f75f4f",
-    "text":        "#e8eaf6",
-    "text_dim":    "#7b8ab0",
-    "preco":       "#1ed99e",
-    "melhor_bg":   "#0c3a2a",
+    "bg":          "#232323",
+    "sidebar":     "#1b1b1b",
+    "card":        "#2b2b2b",
+    "card_hover":  "#363636",
+    "tile":        "#262626",
+    "border":      "#3a3a3a",
+    "accent":      "#f2645a",   # coral (destaque principal, como no print)
+    "accent_hi":   "#e0483d",   # vermelho mais forte (hover / logo)
+    "accent2":     "#4ecb71",   # verde (IA online / disponivel)
+    "accent3":     "#f0a35a",   # laranja (ofertas)
+    "danger":      "#e0483d",
+    "text":        "#f2f2f2",
+    "text_dim":    "#9a9a9a",
+    "preco":       "#4ecb71",   # verde para o preco (legibilidade)
+    "melhor_bg":   "#2f2320",   # destaque do menor preco (avermelhado escuro)
 }
 
 # Nomes amigaveis dos provedores de IA (para o painel de status na barra lateral)
@@ -72,23 +73,24 @@ IAS_LABELS = {
 }
 
 LOJAS_CONFIG = {
-    "diniz":    "Diniz",
-    "saoluiz":  "Sao Luiz",
-    "atacadao": "Atacadao",
-    "assai":    "Assai (encarte)",
+    "aurora":    "Aurora",
+    "vizinho":  "Vizinho",
+    "atacauno": "Atacado Uno",
+    "atacadois":    "Atacado Dois (encarte)",
 }
 
 
 class AppPesquisaPreco(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("SuperPreco Ceara v5.0 — Inteligencia de Mercado")
+        self.title("Falcons Data")
         self.geometry("1280x820")
         self.minsize(1024, 640)
         self.configure(fg_color=C["bg"])
         self._estados = {
             "busca":    {"resultados": [], "buscando": False, "cancelar": threading.Event()},
             "encartes": {"resultados": [], "buscando": False, "cancelar": threading.Event()},
+            "monitor":  {"rodando": False, "parar": threading.Event()},
         }
         self._build_layout()
         self._apply_ttk_style()
@@ -116,9 +118,11 @@ class AppPesquisaPreco(ctk.CTk):
         self._tabview.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
         self._tabview._segmented_button.configure(font=ctk.CTkFont("Segoe UI", 13, "bold"))
         self._tab_busca    = self._tabview.add("  Busca Unificada")
+        self._tab_monitor  = self._tabview.add("  Monitor")
         self._tab_encartes = self._tabview.add("  Encartes")
         self._tab_config   = self._tabview.add("  Configuracoes")
         self._build_tab_busca()
+        self._build_tab_monitor()
         self._build_tab_encartes()
         self._build_tab_config()
 
@@ -129,10 +133,19 @@ class AppPesquisaPreco(ctk.CTk):
         sb.grid_columnconfigure(0, weight=1)
         sb.grid_rowconfigure(9, weight=1)
 
-        ctk.CTkLabel(sb, text="SUPERPRECO", font=ctk.CTkFont("Segoe UI", 22, "bold"),
-                     text_color=C["accent"]).grid(row=0, column=0, pady=(24, 2))
-        ctk.CTkLabel(sb, text="CEARA v5.0", font=ctk.CTkFont("Segoe UI", 11, "bold"),
-                     text_color=C["accent2"]).grid(row=1, column=0, pady=(0, 16))
+        marca = ctk.CTkFrame(sb, fg_color="transparent")
+        marca.grid(row=0, column=0, pady=(22, 2))
+        badge = ctk.CTkFrame(marca, width=56, height=56, corner_radius=28, fg_color=C["accent_hi"])
+        badge.pack(pady=(0, 8))
+        badge.pack_propagate(False)
+        ctk.CTkLabel(badge, text="F", font=ctk.CTkFont("Segoe UI", 27, "bold"),
+                     text_color="#ffffff").pack(expand=True)
+        ctk.CTkLabel(marca, text="F A L C O N S", font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     text_color=C["text_dim"]).pack()
+        ctk.CTkLabel(marca, text="DATA", font=ctk.CTkFont("Segoe UI", 26, "bold"),
+                     text_color=C["accent"]).pack()
+        ctk.CTkLabel(sb, text="Inteligencia de Precos", font=ctk.CTkFont("Segoe UI", 10, slant="italic"),
+                     text_color=C["text_dim"]).grid(row=1, column=0, pady=(2, 16))
         ctk.CTkFrame(sb, height=1, fg_color=C["border"]).grid(row=2, column=0, sticky="ew", padx=16, pady=(0,16))
 
         ctk.CTkLabel(sb, text="INTELIGENCIAS EM CONJUNTO", font=ctk.CTkFont("Segoe UI", 9, "bold"),
@@ -156,7 +169,7 @@ class AppPesquisaPreco(ctk.CTk):
             text_color=C["text"], font=ctk.CTkFont("Segoe UI",12), height=34, corner_radius=8,
             command=self._exportar_csv
         ).grid(row=12, column=0, sticky="ew", padx=16, pady=4)
-        ctk.CTkLabel(sb, text="© 2025 Ceara Edition", font=ctk.CTkFont("Segoe UI",9),
+        ctk.CTkLabel(sb, text="© Falcons Data", font=ctk.CTkFont("Segoe UI",9),
                      text_color=C["text_dim"]).grid(row=13, column=0, pady=(8,16))
 
     def _build_header(self):
@@ -164,7 +177,7 @@ class AppPesquisaPreco(ctk.CTk):
         hdr.grid(row=0, column=0, sticky="ew", padx=16, pady=(12,8))
         hdr.grid_columnconfigure(0, weight=1)
         hdr.grid_propagate(False)
-        ctk.CTkLabel(hdr, text="SuperPreco Ceara — Central de Inteligencia de Mercado",
+        ctk.CTkLabel(hdr, text="Falcons Data — Central de Inteligencia de Mercado",
                      font=ctk.CTkFont("Segoe UI", 18, "bold"), text_color=C["text"]).grid(row=0, column=0, sticky="w")
         self._lbl_hora = ctk.CTkLabel(hdr, text="", font=ctk.CTkFont("Segoe UI",11), text_color=C["text_dim"])
         self._lbl_hora.grid(row=0, column=1, sticky="e")
@@ -211,24 +224,11 @@ class AppPesquisaPreco(ctk.CTk):
         
         ctk.CTkLabel(pl, text="Lojas Monitoradas:", font=ctk.CTkFont("Segoe UI",11,"bold"), text_color=C["accent"]).grid(row=0, column=0, sticky="w", padx=12, pady=(8,4))
         
-        frame_grid_lojas = ctk.CTkFrame(pl, fg_color="transparent")
-        frame_grid_lojas.grid(row=1, column=0, sticky="ew", padx=12, pady=(0,8))
-        
+        self._frame_grid_lojas = ctk.CTkFrame(pl, fg_color="transparent")
+        self._frame_grid_lojas.grid(row=1, column=0, sticky="ew", padx=12, pady=(0,8))
         self._check_vars = {}
-        items = list(LOJAS_CONFIG.items())
-        cols_per_row = 6
-        for idx, (chave, nome) in enumerate(items):
-            r = idx // cols_per_row
-            c = idx % cols_per_row
-            var = tk.BooleanVar(value=True)
-            self._check_vars[chave] = var
-            ctk.CTkCheckBox(
-                frame_grid_lojas, text=nome, variable=var,
-                font=ctk.CTkFont("Segoe UI",11), fg_color=C["accent"],
-                hover_color="#3a7af5", text_color=C["text"], checkmark_color="white",
-                border_color=C["border"], width=130
-            ).grid(row=r, column=c, padx=6, pady=4, sticky="w")
-            
+        self._montar_checkboxes_lojas()
+
         # Botões de controle rápido
         btn_box = ctk.CTkFrame(pl, fg_color="transparent")
         btn_box.grid(row=2, column=0, sticky="w", padx=12, pady=(0,8))
@@ -286,6 +286,33 @@ class AppPesquisaPreco(ctk.CTk):
         self._txt_resumo.insert("end", "O resumo executivo de IA aparecera aqui apos a busca...")
         self._txt_resumo.configure(state="disabled")
 
+    def _lojas_disponiveis(self) -> dict:
+        """Lojas fixas + sites cadastrados pelo usuario."""
+        lojas = dict(LOJAS_CONFIG)
+        try:
+            for s in engine.carregar_sites_customizados():
+                lojas[s["chave"]] = s.get("nome", s["chave"])
+        except Exception:
+            pass
+        return lojas
+
+    def _montar_checkboxes_lojas(self):
+        """(Re)constroi os checkboxes de lojas (inclui sites cadastrados)."""
+        for w in self._frame_grid_lojas.winfo_children():
+            w.destroy()
+        anteriores = {k: v.get() for k, v in self._check_vars.items()}
+        self._check_vars = {}
+        cols_per_row = 4
+        for idx, (chave, nome) in enumerate(self._lojas_disponiveis().items()):
+            var = tk.BooleanVar(value=anteriores.get(chave, True))
+            self._check_vars[chave] = var
+            ctk.CTkCheckBox(
+                self._frame_grid_lojas, text=nome, variable=var,
+                font=ctk.CTkFont("Segoe UI", 11), fg_color=C["accent"],
+                hover_color=C["accent_hi"], text_color=C["text"], checkmark_color="white",
+                border_color=C["border"], width=150
+            ).grid(row=idx // cols_per_row, column=idx % cols_per_row, padx=6, pady=4, sticky="w")
+
     def _criar_tile(self, parent, col, titulo, cor):
         card = ctk.CTkFrame(parent, fg_color=C["tile"], corner_radius=10,
                             border_width=1, border_color=C["border"])
@@ -306,7 +333,7 @@ class AppPesquisaPreco(ctk.CTk):
         pe = ctk.CTkFrame(tab, fg_color=C["bg"], corner_radius=10)
         pe.grid(row=0, column=0, sticky="ew", padx=12, pady=(12,6))
         pe.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(pe, text="Varredura de Encartes PDF de todas as redes do Ceara",
+        ctk.CTkLabel(pe, text="Varredura de Encartes PDF de todas as redes do regiao",
                      font=ctk.CTkFont("Segoe UI",13,"bold"), text_color=C["text"]).grid(row=0, column=0, padx=16, pady=14, sticky="w")
         self._btn_encartes = ctk.CTkButton(
             pe, text="Buscar Encartes", font=ctk.CTkFont("Segoe UI",13,"bold"),
@@ -387,6 +414,248 @@ class AppPesquisaPreco(ctk.CTk):
             font=ctk.CTkFont("Segoe UI",11), text_color=C["text_dim"], justify="left"
         ).pack(anchor="w", padx=20)
 
+        # ── Sites personalizados (cadastro pelo usuario) ─────────────────────
+        ctk.CTkFrame(frame, height=1, fg_color=C["border"]).pack(fill="x", padx=20, pady=16)
+        ctk.CTkLabel(frame, text="Sites personalizados (entram na busca)",
+                     font=ctk.CTkFont("Segoe UI",13,"bold"), text_color=C["accent"]).pack(anchor="w", padx=20, pady=(0,4))
+        ctk.CTkLabel(frame, text="Cadastre outra loja: nome da empresa + link de busca (use {produto} onde vai o termo).\n"
+                                 "A pagina sera lida pela IA para extrair os produtos.",
+                     font=ctk.CTkFont("Segoe UI",10), text_color=C["text_dim"], justify="left").pack(anchor="w", padx=20)
+
+        form = ctk.CTkFrame(frame, fg_color="transparent")
+        form.pack(fill="x", padx=20, pady=8)
+        self._entry_site_nome = ctk.CTkEntry(form, width=180, placeholder_text="Nome da empresa",
+                                             fg_color=C["bg"], border_color=C["border"], text_color=C["text"])
+        self._entry_site_nome.pack(side="left", padx=(0,8))
+        self._entry_site_url = ctk.CTkEntry(form, width=380, placeholder_text="https://loja.com.br/busca?q={produto}",
+                                            fg_color=C["bg"], border_color=C["border"], text_color=C["text"])
+        self._entry_site_url.pack(side="left", padx=(0,8))
+        ctk.CTkButton(form, text="Adicionar site", width=120, height=30, fg_color=C["accent"],
+                      hover_color=C["accent_hi"], text_color="#ffffff", font=ctk.CTkFont("Segoe UI",11,"bold"),
+                      corner_radius=8, command=self._adicionar_site).pack(side="left")
+
+        self._frame_sites = ctk.CTkFrame(frame, fg_color="transparent")
+        self._frame_sites.pack(fill="x", padx=20, pady=(4,12))
+        self._montar_lista_sites()
+
+    def _montar_lista_sites(self):
+        for w in self._frame_sites.winfo_children():
+            w.destroy()
+        sites = engine.carregar_sites_customizados()
+        if not sites:
+            ctk.CTkLabel(self._frame_sites, text="Nenhum site cadastrado ainda.",
+                         font=ctk.CTkFont("Segoe UI",10,slant="italic"), text_color=C["text_dim"]).pack(anchor="w")
+            return
+        for s in sites:
+            row = ctk.CTkFrame(self._frame_sites, fg_color=C["tile"], corner_radius=6)
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=f"  {s.get('nome','?')}", font=ctk.CTkFont("Segoe UI",11,"bold"),
+                         text_color=C["text"], width=170, anchor="w").pack(side="left", padx=(4,8), pady=4)
+            ctk.CTkLabel(row, text=s.get("url_busca","")[:70], font=ctk.CTkFont("Segoe UI",10),
+                         text_color=C["text_dim"], anchor="w").pack(side="left", fill="x", expand=True)
+            ctk.CTkButton(row, text="Remover", width=80, height=24, fg_color=C["border"],
+                          hover_color=C["danger"], text_color=C["text"], font=ctk.CTkFont("Segoe UI",10),
+                          corner_radius=6, command=lambda ch=s.get("chave"): self._remover_site(ch)).pack(side="right", padx=6)
+
+    def _adicionar_site(self):
+        nome = self._entry_site_nome.get().strip()
+        url = self._entry_site_url.get().strip()
+        if not nome or not url:
+            messagebox.showwarning("Campos vazios", "Preencha o nome da empresa e o link de busca.")
+            return
+        site = engine.salvar_site_customizado(nome, url)
+        if not site:
+            messagebox.showwarning("Invalido", "Nao consegui cadastrar. Confira o link informado.")
+            return
+        self._entry_site_nome.delete(0, "end")
+        self._entry_site_url.delete(0, "end")
+        self._montar_lista_sites()
+        self._montar_checkboxes_lojas()
+        messagebox.showinfo("Site cadastrado",
+                            f"'{nome}' entrou na busca. A pagina dele sera lida pela IA.")
+
+    def _remover_site(self, chave):
+        engine.remover_site_customizado(chave)
+        self._montar_lista_sites()
+        self._montar_checkboxes_lojas()
+
+    # ── Monitor (Fase E) ────────────────────────────────────────────────────
+    def _build_tab_monitor(self):
+        tab = self._tab_monitor
+        tab.configure(fg_color=C["card"])
+        tab.grid_rowconfigure(3, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        top = ctk.CTkFrame(tab, fg_color=C["bg"], corner_radius=10)
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        top.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(top, text="Produto:", font=ctk.CTkFont("Segoe UI",12,"bold"),
+                     text_color=C["text"]).grid(row=0, column=0, padx=(14,8), pady=12)
+        self._entry_monitor = ctk.CTkEntry(top, placeholder_text="Ex: coca cola 2l",
+                                           fg_color=C["card"], border_color=C["border"], text_color=C["text"], height=36)
+        self._entry_monitor.grid(row=0, column=1, sticky="ew", padx=8, pady=12)
+        self._entry_monitor.bind("<Return>", lambda e: self._monitor_add())
+        ctk.CTkButton(top, text="Adicionar", width=110, height=36, fg_color=C["accent"],
+                      hover_color=C["accent_hi"], text_color="#ffffff", font=ctk.CTkFont("Segoe UI",12,"bold"),
+                      corner_radius=8, command=self._monitor_add).grid(row=0, column=2, padx=(4,14), pady=12)
+
+        self._frame_watch = ctk.CTkFrame(tab, fg_color="transparent")
+        self._frame_watch.grid(row=1, column=0, sticky="ew", padx=12, pady=(0,6))
+
+        ctr = ctk.CTkFrame(tab, fg_color=C["bg"], corner_radius=10)
+        ctr.grid(row=2, column=0, sticky="ew", padx=12, pady=(0,8))
+        self._btn_monitor_agora = ctk.CTkButton(
+            ctr, text="Rodar agora", width=130, height=34, fg_color=C["accent"],
+            hover_color=C["accent_hi"], text_color="#ffffff", font=ctk.CTkFont("Segoe UI",12,"bold"),
+            corner_radius=8, command=self._monitor_rodar_agora)
+        self._btn_monitor_agora.pack(side="left", padx=(14,10), pady=12)
+        ctk.CTkLabel(ctr, text="Intervalo (min):", font=ctk.CTkFont("Segoe UI",12),
+                     text_color=C["text"]).pack(side="left")
+        self._entry_intervalo = ctk.CTkEntry(ctr, width=70, placeholder_text="30",
+                     fg_color=C["card"], border_color=C["border"], text_color=C["text"])
+        self._entry_intervalo.pack(side="left", padx=10)
+        self._btn_monitor_toggle = ctk.CTkButton(
+            ctr, text="Iniciar monitor", width=150, height=34, fg_color=C["border"],
+            hover_color=C["card_hover"], text_color=C["text"], font=ctk.CTkFont("Segoe UI",12,"bold"),
+            corner_radius=8, command=self._monitor_toggle)
+        self._btn_monitor_toggle.pack(side="left", padx=10)
+        self._lbl_monitor_status = ctk.CTkLabel(ctr, text="parado", font=ctk.CTkFont("Segoe UI",11),
+                     text_color=C["text_dim"])
+        self._lbl_monitor_status.pack(side="left", padx=10)
+
+        ft = ctk.CTkFrame(tab, fg_color=C["card"], corner_radius=10)
+        ft.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0,12))
+        ft.grid_rowconfigure(0, weight=1)
+        ft.grid_columnconfigure(0, weight=1)
+        self._tree_monitor = self._criar_tabela(ft, [
+            ("Produto", 160), ("Loja", 150), ("Preco atual", 110),
+            ("Anterior", 100), ("Variacao", 110), ("Atualizado", 150),
+        ])
+        self._monitor_montar_lista()
+        self._monitor_atualizar_tabela()
+
+    def _monitor_montar_lista(self):
+        for w in self._frame_watch.winfo_children():
+            w.destroy()
+        termos = engine.carregar_watchlist()
+        if not termos:
+            ctk.CTkLabel(self._frame_watch, text="Nenhum produto no monitor. Adicione acima.",
+                         font=ctk.CTkFont("Segoe UI",10,slant="italic"), text_color=C["text_dim"]).pack(anchor="w", padx=4)
+            return
+        for t in termos:
+            chip = ctk.CTkFrame(self._frame_watch, fg_color=C["tile"], corner_radius=14)
+            chip.pack(side="left", padx=4, pady=4)
+            ctk.CTkLabel(chip, text=t, font=ctk.CTkFont("Segoe UI",11),
+                         text_color=C["text"]).pack(side="left", padx=(10,4), pady=4)
+            ctk.CTkButton(chip, text="✕", width=22, height=22, fg_color="transparent",
+                          hover_color=C["danger"], text_color=C["text_dim"],
+                          font=ctk.CTkFont("Segoe UI",11,"bold"), corner_radius=11,
+                          command=lambda x=t: self._monitor_remove(x)).pack(side="left", padx=(0,4))
+
+    def _monitor_add(self):
+        termo = self._entry_monitor.get().strip()
+        if not termo:
+            return
+        termos = engine.carregar_watchlist()
+        if termo.lower() not in [x.lower() for x in termos]:
+            termos.append(termo)
+            engine.salvar_watchlist(termos)
+        self._entry_monitor.delete(0, "end")
+        self._monitor_montar_lista()
+
+    def _monitor_remove(self, termo):
+        engine.salvar_watchlist([x for x in engine.carregar_watchlist() if x != termo])
+        self._monitor_montar_lista()
+
+    def _monitor_atualizar_tabela(self):
+        self._limpar_tabela(self._tree_monitor)
+        for termo in engine.carregar_watchlist():
+            try:
+                variacoes = engine.monitor_variacao(termo)
+            except Exception:
+                variacoes = []
+            for v in variacoes:
+                atual = f"R$ {v['atual']:.2f}".replace('.', ',') if v['atual'] is not None else "—"
+                ant = f"R$ {v['anterior']:.2f}".replace('.', ',') if v['anterior'] is not None else "—"
+                if v['var'] is None:
+                    varic = "—"
+                elif v['var'] > 0.05:
+                    varic = f"▲ {v['var']:+.1f}%"
+                elif v['var'] < -0.05:
+                    varic = f"▼ {v['var']:+.1f}%"
+                else:
+                    varic = "= 0%"
+                self._tree_monitor.insert("", "end", values=(termo, v['loja'], atual, ant, varic, v['data']))
+
+    def _monitor_rodar_agora(self):
+        termos = engine.carregar_watchlist()
+        if not termos:
+            messagebox.showinfo("Monitor vazio", "Adicione ao menos um produto ao monitor.")
+            return
+        lojas = [k for k, val in self._check_vars.items() if val.get()]
+        self._btn_monitor_agora.configure(state="disabled")
+        self._lbl_monitor_status.configure(text="coletando...")
+
+        def _run():
+            for termo in termos:
+                try:
+                    res = engine.raspar_todos_paralelo(
+                        produto=termo, lojas_selecionadas=lojas or None,
+                        max_workers=int(self._slider_workers.get()),
+                        timeout_por_loja=int(self._slider_timeout.get()),
+                        limite_por_loja=5,
+                    )
+                    engine.monitor_registrar(termo, res)
+                except Exception as e:
+                    engine.logger.warning("monitor rodar %s: %s", termo, e)
+            self.after(0, self._monitor_fim_coleta)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _monitor_fim_coleta(self):
+        self._btn_monitor_agora.configure(state="normal")
+        self._lbl_monitor_status.configure(text=f"atualizado {datetime.now().strftime('%H:%M:%S')}")
+        self._monitor_atualizar_tabela()
+
+    def _monitor_toggle(self):
+        est = self._estados["monitor"]
+        if est["rodando"]:
+            est["parar"].set()
+            est["rodando"] = False
+            self._btn_monitor_toggle.configure(text="Iniciar monitor")
+            self._lbl_monitor_status.configure(text="parado")
+            return
+        try:
+            intervalo = max(1, int(self._entry_intervalo.get().strip() or "30"))
+        except Exception:
+            intervalo = 30
+        est["parar"].clear()
+        est["rodando"] = True
+        self._btn_monitor_toggle.configure(text="Parar monitor")
+        self._lbl_monitor_status.configure(text=f"monitorando a cada {intervalo} min")
+
+        def _loop():
+            while not est["parar"].is_set():
+                termos = engine.carregar_watchlist()
+                lojas = [k for k, val in self._check_vars.items() if val.get()]
+                for termo in termos:
+                    if est["parar"].is_set():
+                        break
+                    try:
+                        res = engine.raspar_todos_paralelo(
+                            produto=termo, lojas_selecionadas=lojas or None,
+                            parar_event=est["parar"],
+                            max_workers=int(self._slider_workers.get()),
+                            timeout_por_loja=int(self._slider_timeout.get()),
+                            limite_por_loja=5)
+                        engine.monitor_registrar(termo, res)
+                    except Exception as e:
+                        engine.logger.warning("monitor loop %s: %s", termo, e)
+                self.after(0, self._monitor_atualizar_tabela)
+                est["parar"].wait(intervalo * 60)
+
+        threading.Thread(target=_loop, daemon=True).start()
+
     def _criar_tabela(self, parent, colunas):
         frame = ctk.CTkFrame(parent, fg_color="transparent")
         frame.pack(fill="both", expand=True, padx=8, pady=8)
@@ -450,7 +719,7 @@ class AppPesquisaPreco(ctk.CTk):
         estado["resultados"] = []
         self._limpar_tabela(self._tree_busca)
         self._resetar_tiles()
-        self._set_resumo("Buscando precos em paralelo nas redes do Ceara...")
+        self._set_resumo("Buscando precos em paralelo nas redes do regiao...")
         self._lbl_status.configure(text=f"Buscando '{produto}' em {len(lojas)} loja(s)...")
         self._progress.configure(mode="indeterminate")
         self._progress.start()
