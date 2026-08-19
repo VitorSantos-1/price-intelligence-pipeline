@@ -3459,6 +3459,530 @@ def _menu_categorias(pagina, contexto):
     _exibir_e_exportar(resultados)
 
 
+# ==========================================
+# CONFRONTO DE CATALOGO (v6.2): importar CSV (nome;ean) e casar com concorrentes
+# ==========================================
+# Fluxo: para cada item do CSV, busca nos concorrentes e escolhe o MELHOR match
+# por loja usando (1) EAN confiavel identico, (2) NLP robusto (gramatura +
+# variantes, ja no ComparadorInteligenteProdutos) e (3) confirmacao por IA na
+# zona de duvida. Classifica em faixas de confianca e exporta EAN;PRECO (.txt)
+# + planilha detalhada (.csv). Regra do usuario: similaridade >= 75% = mesmo produto.
+CONFRONTO_LIMIAR_MATCH = 0.75      # >= isso e considerado "o mesmo produto"
+CONFRONTO_LIMIAR_CONFERIR = 0.50   # entre CONFERIR e MATCH: zona amarela (IA decide)
+
+
+def _ean_normalizado(valor) -> str:
+    """EAN como string de digitos INTEIRA. Recupera o codigo cheio quando o
+    Excel exportou como float ('7891234567890.0') ou notacao cientifica
+    ('7.89123E+12'). Retorna '' se nao houver digitos."""
+    if valor is None:
+        return ""
+    s = str(valor).strip()
+    if not s:
+        return ""
+    if re.fullmatch(r'\d+\.0+', s):
+        s = s.split('.')[0]
+    elif re.search(r'[eE]\+?\d+', s):
+        try:
+            s = str(int(float(s)))
+        except (ValueError, OverflowError):
+            pass
+    return re.sub(r'\D', '', s)
+
+
+def _ean_confiavel(ean: str) -> bool:
+    """EAN valido (Mod 10) E que NAO comece com '2'. Codigos iniciados em 2 sao
+    de balanca (acougue/hortifruti/padaria): cada rede usa um padrao proprio de
+    peso/preco embutido, entao nunca casar produtos por esses codigos."""
+    ean = _ean_normalizado(ean)
+    if not ean or ean.startswith('2'):
+        return False
+    if len(set(ean)) == 1:   # ficticio/lixo: 0000000000000, 1111111111111...
+        return False
+    return validar_ean(ean)
+
+
+def _preco_num_generico(r: dict):
+    """Preco efetivo (oferta se houver, senao normal) como float, ou None."""
+    for campo in ("preco_oferta", "preco_normal"):
+        vals = _precos_do_texto(r.get(campo) or "")
+        if vals:
+            return vals[0]
+    return None
+
+
+def _fmt_preco_decimal(v) -> str:
+    """Preco decimal no padrao BR (virgula). Ex.: 12.9 -> '12,90'. '' se None."""
+    return "" if v is None else f"{v:.2f}".replace('.', ',')
+
+
+def _parece_ean(v) -> bool:
+    """True se o valor for SO digitos com 8-14 caracteres (cara de EAN/GTIN)."""
+    s = str(v or "").strip()
+    return s.isdigit() and 8 <= len(s) <= 14
+
+
+def ler_catalogo_csv(caminho: str) -> list:
+    """Le o CSV do usuario e AUTO-DETECTA qual coluna e o EAN e qual e o NOME
+    pelo CONTEUDO (nao pela ordem) — funciona com 'nome;ean', 'ean;nome', com ou
+    sem cabecalho, separador ',' ou ';'. Retorna [{'nome','ean'}]."""
+    itens = []
+    if not caminho or not os.path.exists(caminho):
+        return itens
+    with open(caminho, 'r', encoding='utf-8-sig', newline='') as f:
+        amostra = f.readline()
+        sep = ';' if amostra.count(';') >= amostra.count(',') else ','
+        f.seek(0)
+        linhas = [r for r in csv.reader(f, delimiter=sep) if r and any((c or '').strip() for c in r)]
+    if not linhas:
+        return itens
+    ncols = max(len(r) for r in linhas)
+
+    # Pula cabecalho SO se a 1a linha tem palavra conhecida e nenhum valor com cara de EAN.
+    conhecidos = ('nome', 'produto', 'descricao', 'descrição', 'name', 'titulo', 'título',
+                  'ean', 'gtin', 'codigo', 'código', 'codigo_barras', 'cod_barras', 'barcode',
+                  'preco', 'preço')
+    cab = [(c or '').strip().lower() for c in linhas[0]]
+    tem_cab = any(c in conhecidos for c in cab) and not any(_parece_ean(c) for c in linhas[0])
+    corpo = linhas[1:] if tem_cab else linhas
+    if not corpo:
+        corpo = linhas
+
+    # Auto-deteccao por conteudo: coluna mais "EAN-like" = EAN; a mais textual = nome.
+    score_ean = [0] * ncols
+    score_txt = [0] * ncols
+    for r in corpo[:100]:
+        for i in range(ncols):
+            v = (r[i] if i < len(r) else "").strip()
+            if _parece_ean(v):
+                score_ean[i] += 1
+            elif re.search(r'[A-Za-zÀ-ÿ]', v):
+                score_txt[i] += 1
+    col_ean = max(range(ncols), key=lambda i: score_ean[i]) if any(score_ean) else None
+    cands_nome = [i for i in range(ncols) if i != col_ean]
+    if cands_nome and any(score_txt[i] for i in cands_nome):
+        col_nome = max(cands_nome, key=lambda i: score_txt[i])
+    else:
+        col_nome = 0 if col_ean != 0 else (1 if ncols > 1 else 0)
+
+    for r in corpo:
+        nome = (r[col_nome] if col_nome < len(r) else "").strip()
+        ean = _ean_normalizado(r[col_ean]) if (col_ean is not None and col_ean < len(r)) else ""
+        if nome:
+            itens.append({"nome": nome, "ean": ean})
+    return itens
+
+
+def ia_confirmar_equivalencia(meu_nome: str, meu_ean: str, candidato_nome: str) -> bool:
+    """Usa a IA para confirmar se dois titulos sao o MESMO produto (marca, tipo,
+    variacao e gramatura). Retorna True so em 'SIM'. Sem IA disponivel: False."""
+    if not _existe_alguma_ia() or not candidato_nome:
+        return False
+    ctx_ean = f" (EAN do meu produto: {meu_ean})" if meu_ean else ""
+    instrucao = (
+        "Voce compara produtos de supermercado. Diga SIM apenas se forem o MESMO\n"
+        "produto: mesma marca, mesmo tipo, mesma variacao (Zero/Diet/Light/Integral/\n"
+        "Sabor) e mesma gramatura/volume. Caso contrario, NAO.\n"
+        f"Meu produto: \"{meu_nome}\"{ctx_ean}\n"
+        f"Concorrente: \"{candidato_nome}\"\n"
+        "Sao o mesmo produto? Responda SOMENTE SIM ou NAO."
+    )
+    try:
+        resp = ia_chat(
+            [{"role": "system", "content": "Responda apenas SIM ou NAO."},
+             {"role": "user", "content": instrucao}],
+            temperatura=0.0, max_tokens=5, ordem=_ORDEM_IA_PRECISA,
+        )
+    except Exception as e:
+        logger.debug("ia_confirmar_equivalencia: %s", e)
+        return False
+    return bool(resp) and resp.strip().upper().startswith("SIM")
+
+
+def _melhor_match_loja(meu_nome: str, meu_ean: str, candidatos: list, usar_ia: bool):
+    """Escolhe o melhor produto de UMA loja para o item do usuario.
+    Retorna (produto, faixa, score) ou None. Faz no maximo 1 chamada de IA."""
+    # 1) EAN confiavel identico -> Verde (match mais forte que existe)
+    if meu_ean and _ean_confiavel(meu_ean):
+        for r in candidatos:
+            if _ean_normalizado(r.get("ean")) == meu_ean:
+                return r, "Verde", 0.99
+    # 2) melhor por NLP robusto (gramatura + variantes ja embutidas)
+    melhor_r, melhor_score = None, -1.0
+    for r in candidatos:
+        s = ComparadorInteligenteProdutos.calcular_relevancia(meu_nome, r.get("produto_encontrado", ""))
+        if s > melhor_score:
+            melhor_r, melhor_score = r, s
+    if melhor_r is None:
+        return None
+    if melhor_score >= CONFRONTO_LIMIAR_MATCH:
+        return melhor_r, "Azul", melhor_score
+    # 3) zona de duvida: a IA decide (parametriza o NLP)
+    if melhor_score >= CONFRONTO_LIMIAR_CONFERIR:
+        if usar_ia and ia_confirmar_equivalencia(meu_nome, meu_ean, melhor_r.get("produto_encontrado", "")):
+            return melhor_r, "Azul", max(melhor_score, CONFRONTO_LIMIAR_MATCH)
+        return melhor_r, "Amarelo", melhor_score
+    # 4) fraco demais -> descartado
+    return None
+
+
+# ---- Lookups RAPIDOS: sessao capturada 1x, depois HTTP puro por item --------
+def _get_json_retry(url, headers=None, cookies=None, timeout=12, tentativas=2):
+    """GET JSON com retry leve. Retorna dict ({} em falha)."""
+    for _ in range(max(1, tentativas)):
+        try:
+            r = requests.get(url, headers=headers, cookies=cookies, timeout=timeout)
+            if r.status_code in (200, 206):
+                return r.json()
+            if r.status_code in (429, 500, 502, 503):
+                time.sleep(0.6)
+                continue
+            return {}
+        except Exception:
+            time.sleep(0.4)
+    return {}
+
+
+def _termo_reduzido(nome, n=4):
+    """Primeiros N tokens significativos (para 2a tentativa mais ampla)."""
+    toks = ComparadorInteligenteProdutos.tokenizar(nome or "")
+    return " ".join(toks[:n]) if toks else (nome or "")
+
+
+def _sessao_aurora(pagina, contexto):
+    """Captura (1x) base/headers/session/cookies da API VipCommerce da Aurora."""
+    cap = {"base": None, "headers": None, "session": ""}
+
+    def _cap(req):
+        if "buscas/produtos/termo" in req.url and cap["base"] is None:
+            try:
+                pu = urlparse(req.url)
+                cap["base"] = f"{pu.scheme}://{pu.netloc}" + re.sub(r'/termo/[^/?]*$', '/termo/', pu.path)
+                cap["session"] = parse_qs(pu.query).get("session", [""])[0]
+                cap["headers"] = {k: v for k, v in req.headers.items()
+                                  if k.lower() not in ("host", "content-length", ":authority")}
+            except Exception as e:
+                logger.debug("sessao aurora cap: %s", e)
+
+    pagina.on("request", _cap)
+    try:
+        pagina.goto("https://www.superaurora.com.br/busca?termo=arroz",
+                    timeout=40000, wait_until="domcontentloaded")
+        for _ in range(6):
+            if cap["base"]:
+                break
+            pagina.wait_for_timeout(800)
+    except Exception as e:
+        logger.debug("sessao aurora goto: %s", e)
+    try:
+        pagina.remove_listener("request", _cap)
+    except Exception:
+        pass
+    if not (cap["base"] and cap["headers"]):
+        return None
+    try:
+        cap["cookies"] = {c["name"]: c["value"] for c in contexto.cookies()}
+    except Exception:
+        cap["cookies"] = {}
+    return cap
+
+
+def _sessao_vizinho(pagina, market="369"):
+    """Captura (1x) o Bearer token da API Mercadapp do Vizinho (espera robusta)."""
+    tok = {"v": None}
+
+    def _cap(req):
+        if "items/search" in req.url and not tok["v"]:
+            try:
+                t = req.headers.get("authorization")
+                if t:
+                    tok["v"] = t
+            except Exception:
+                pass
+
+    pagina.on("request", _cap)
+    try:
+        pagina.goto(f"https://mercadinhosvizinho.com.br/loja/{market}?search=arroz",
+                    timeout=40000, wait_until="domcontentloaded")
+        for _ in range(8):
+            if tok["v"]:
+                break
+            pagina.wait_for_timeout(1200)
+    except Exception as e:
+        logger.debug("sessao vizinho goto: %s", e)
+    try:
+        pagina.remove_listener("request", _cap)
+    except Exception:
+        pass
+    if not tok["v"]:
+        return None
+    return {"market": market,
+            "headers": {**CABECALHOS_REQUISICAO, "Accept": "application/json",
+                        "Authorization": tok["v"], "Origin": "https://mercadinhosvizinho.com.br",
+                        "Referer": "https://mercadinhosvizinho.com.br/"}}
+
+
+def _atacauno_query(q, region):
+    """Uma consulta a VTEX IS do Atacado Uno (por EAN OU por nome)."""
+    if not q:
+        return []
+    sufixo = f"&regionId={region}" if region else ""
+    url = (f"https://www.atacadouno.com.br/api/io/_v/api/intelligent-search/"
+           f"product_search?query={quote_plus(str(q))}&count=8{sufixo}")
+    dados = _get_json_retry(url, headers={**CABECALHOS_REQUISICAO, 'Accept': 'application/json',
+                                          'Referer': 'https://www.atacadouno.com.br/'})
+    out = []
+    for p in (dados.get("products", []) if isinstance(dados, dict) else []):
+        parsed = _parse_item_vtex_atacauno(p)
+        if parsed:
+            parsed.pop("_sku", None)
+            parsed.pop("_seller", None)
+            out.append(parsed)
+    return out
+
+
+def _lookup_atacauno(region, nome, ean):
+    """EAN PRIMEIRO (exato, vira Verde sem NLP). Se nao achar/sem EAN: por nome
+    (descricao) — e ai o NLP decide. Fallback com nome curto."""
+    if _ean_confiavel(ean):
+        c = _atacauno_query(ean, region)
+        if c:
+            return c
+    c = _atacauno_query(nome, region)
+    if not c:
+        curto = _termo_reduzido(nome)
+        if curto and curto != nome:
+            c = _atacauno_query(curto, region)
+    return c
+
+
+def _aurora_query(sessao, termo):
+    """Uma consulta por termo (descricao) na API VipCommerce da Aurora."""
+    url = f"{sessao['base']}{quote(str(termo))}?page=1&session={sessao['session']}"
+    dados = _get_json_retry(url, headers=sessao.get("headers"), cookies=sessao.get("cookies"))
+    out = []
+    for p in ((dados.get("data") or {}).get("produtos", []) if isinstance(dados, dict) else []):
+        nome = (p.get("descricao") or "").strip()
+        if not nome:
+            continue
+        try:
+            preco = float(str(p.get("preco") or "0").replace(",", "."))
+        except Exception:
+            preco = 0.0
+        if preco <= 0:
+            continue
+        preco_normal, preco_oferta = _fmt_preco(preco), "—"
+        if p.get("em_oferta") and p.get("preco_original"):
+            try:
+                orig = float(str(p.get("preco_original")).replace(",", "."))
+                if orig > preco:
+                    preco_normal, preco_oferta = _fmt_preco(orig), _fmt_preco(preco)
+            except Exception:
+                pass
+        ean = str(p.get("codigo_barras") or "").strip()
+        out.append({
+            "produto_encontrado": nome, "preco_normal": preco_normal, "preco_oferta": preco_oferta,
+            "supermercado": "Aurora Supermercados", "ean": ean if validar_ean(ean) else "—",
+            "url": f"https://www.superaurora.com.br/produto/{p.get('produto_id')}/{p.get('link', '')}",
+        })
+    return out
+
+
+def _lookup_aurora(sessao, nome, ean=""):
+    """Aurora nao busca por EAN de forma confiavel: busca por descricao (nome).
+    O EAN, quando bate NOS RESULTADOS, vira Verde no matcher. Fallback nome curto."""
+    if not sessao or not nome:
+        return []
+    c = _aurora_query(sessao, nome)
+    if not c:
+        curto = _termo_reduzido(nome)
+        if curto and curto != nome:
+            c = _aurora_query(sessao, curto)
+    return c
+
+
+def _vizinho_query(sessao, termo):
+    """Uma consulta por termo (descricao) na API Mercadapp do Vizinho."""
+    url = (f"https://merconnect.mercadapp.com.br/mapp/v3/markets/{sessao['market']}"
+           f"/items/search?page=1&query={quote_plus(str(termo))}")
+    dados = _get_json_retry(url, headers=sessao.get("headers"))
+    out = []
+    for mix in (dados.get("mixes", []) if isinstance(dados, dict) else []):
+        for it in mix.get("items", []):
+            nome = (it.get("description") or "").strip()
+            if not nome:
+                continue
+            try:
+                por = float(it.get("price") or 0)
+            except Exception:
+                por = 0.0
+            if por <= 0:
+                continue
+            try:
+                de = float(it.get("original_price") or 0)
+            except Exception:
+                de = 0.0
+            if it.get("is_offer") and de > por:
+                preco_normal, preco_oferta = _fmt_preco(de), _fmt_preco(por)
+            else:
+                preco_normal, preco_oferta = _fmt_preco(por), "—"
+            ean = str(it.get("bar_code") or "").strip()
+            out.append({
+                "produto_encontrado": nome, "preco_normal": preco_normal, "preco_oferta": preco_oferta,
+                "supermercado": "Mercadinhos Vizinho", "ean": ean if validar_ean(ean) else "—",
+                "url": f"https://mercadinhosvizinho.com.br/loja/{sessao['market']}/produto/{it.get('slug', '')}",
+            })
+    return out
+
+
+def _lookup_vizinho(sessao, nome, ean=""):
+    """Vizinho nao indexa EAN: busca por descricao (nome). EAN nos resultados
+    vira Verde no matcher. Fallback nome curto."""
+    if not sessao or not nome:
+        return []
+    c = _vizinho_query(sessao, nome)
+    if not c:
+        curto = _termo_reduzido(nome)
+        if curto and curto != nome:
+            c = _vizinho_query(sessao, curto)
+    return c
+
+
+def confrontar_catalogo(itens, lojas=None, parar_event=None, max_workers=4,
+                        timeout_por_loja=45, callback_status=None, usar_ia=True,
+                        callback_progresso=None) -> list:
+    """CONFRONTO RAPIDO: captura a sessao de cada loja UMA vez e depois consulta
+    as APIs por HTTP puro, EM PARALELO por item — sem abrir um navegador por item
+    nem paginar. Casa por EAN exato (Verde) ou NLP+IA (Azul/Amarelo). Mesmo
+    retorno de sempre: meu_nome, meu_ean, loja, produto_concorrente,
+    ean_concorrente, preco_normal, preco_oferta, preco_num, similaridade, faixa, url."""
+    itens = [it for it in itens if (it.get("nome") or "").strip()]
+    lojas = lojas or ["aurora", "vizinho", "atacauno"]
+    total = len(itens)
+
+    # ── Fase 1: sessoes (1 navegacao por loja que precisa de auth) ──────────
+    sess = {}
+    region = _atacauno_region_id() if "atacauno" in lojas else None
+    if any(l in ("aurora", "vizinho") for l in lojas):
+        if callback_status:
+            callback_status("Preparando sessoes das lojas (uma vez)...")
+        try:
+            with sync_playwright() as pw:
+                nav = lancar_navegador_seguro(pw)
+                ctx = nav.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    locale="pt-BR")
+                pg = ctx.new_page()
+                if "aurora" in lojas:
+                    sess["aurora"] = _sessao_aurora(pg, ctx)
+                if "vizinho" in lojas:
+                    sess["vizinho"] = _sessao_vizinho(pg)
+                nav.close()
+        except Exception as e:
+            logger.warning("confronto sessoes: %s", e)
+    if callback_status:
+        faltando = [l for l in ("aurora", "vizinho") if l in lojas and not sess.get(l)]
+        if faltando:
+            callback_status("Aviso: sem sessao para " + ", ".join(faltando) + " (essas lojas ficam de fora).")
+
+    # ── Fase 2: lookup por item, em paralelo (HTTP puro) ────────────────────
+    trava = threading.Lock()
+    contador = {"n": 0}
+
+    def _linha(meu_nome, meu_ean, escolha):
+        r, faixa, score = escolha
+        return {
+            "meu_nome": meu_nome, "meu_ean": meu_ean, "loja": r.get("supermercado", ""),
+            "produto_concorrente": r.get("produto_encontrado", ""),
+            "ean_concorrente": _ean_normalizado(r.get("ean")),
+            "preco_normal": r.get("preco_normal", "—"), "preco_oferta": r.get("preco_oferta", "—"),
+            "preco_num": _preco_num_generico(r), "similaridade": round(score * 100, 1),
+            "faixa": faixa, "url": r.get("url", ""),
+        }
+
+    def _processar(item):
+        if parar_event and parar_event.is_set():
+            return []
+        meu_nome = (item.get("nome") or "").strip()
+        meu_ean = _ean_normalizado(item.get("ean"))
+        out = []
+        try:
+            if "atacauno" in lojas:
+                esc = _melhor_match_loja(meu_nome, meu_ean, _lookup_atacauno(region, meu_nome, meu_ean), usar_ia)
+                if esc:
+                    out.append(_linha(meu_nome, meu_ean, esc))
+            if "aurora" in lojas and sess.get("aurora"):
+                esc = _melhor_match_loja(meu_nome, meu_ean, _lookup_aurora(sess["aurora"], meu_nome), usar_ia)
+                if esc:
+                    out.append(_linha(meu_nome, meu_ean, esc))
+            if "vizinho" in lojas and sess.get("vizinho"):
+                esc = _melhor_match_loja(meu_nome, meu_ean, _lookup_vizinho(sess["vizinho"], meu_nome), usar_ia)
+                if esc:
+                    out.append(_linha(meu_nome, meu_ean, esc))
+        except Exception as e:
+            logger.debug("confronto item '%s': %s", meu_nome[:40], e)
+        if not out:
+            # COMPLETUDE: todo item da listagem aparece, mesmo sem match encontrado
+            out.append({
+                "meu_nome": meu_nome, "meu_ean": meu_ean, "loja": "—",
+                "produto_concorrente": "—", "ean_concorrente": "",
+                "preco_normal": "—", "preco_oferta": "—", "preco_num": None,
+                "similaridade": 0, "faixa": "Nao encontrado", "url": "",
+            })
+        with trava:
+            contador["n"] += 1
+            if callback_progresso:
+                callback_progresso(contador["n"] - 1, total, meu_nome)
+        return out
+
+    linhas = []
+    trabalhadores = min(max(int(max_workers) * 2, 8), 16)
+    with ThreadPoolExecutor(max_workers=trabalhadores) as ex:
+        for res in ex.map(_processar, itens):
+            if parar_event and parar_event.is_set():
+                break
+            linhas.extend(res)
+    return linhas
+
+
+def exportar_confronto_txt(linhas, caminho=None, apenas_confirmados=True) -> str:
+    """Exporta 'EAN;PRECO' (um por linha): EAN do SEU catalogo (ancora, inteiro)
+    e o preco do concorrente (decimal BR). Por padrao so Verde/Azul (>=75%)."""
+    if caminho is None:
+        caminho = os.path.join(CSV_DIR, "confronto_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".txt")
+    faixas_ok = {"Verde", "Azul"} if apenas_confirmados else {"Verde", "Azul", "Amarelo"}
+    n = 0
+    with open(caminho, 'w', encoding='utf-8') as f:
+        for ln in linhas:
+            if ln.get("faixa") not in faixas_ok:
+                continue
+            ean = ln.get("meu_ean") or ln.get("ean_concorrente")
+            preco = ln.get("preco_num")
+            if not ean or preco is None:
+                continue
+            f.write(f"{ean};{_fmt_preco_decimal(preco)}\n")
+            n += 1
+    logger.info("Confronto TXT: %d linha(s) em %s", n, caminho)
+    return caminho
+
+
+def exportar_confronto_csv(linhas, caminho=None) -> str:
+    """Planilha detalhada do confronto (auditoria), separador ';' (abre no Excel BR)."""
+    if caminho is None:
+        caminho = os.path.join(CSV_DIR, "confronto_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv")
+    with open(caminho, 'w', encoding='utf-8-sig', newline='') as f:
+        w = csv.writer(f, delimiter=';')
+        w.writerow(["Meu Produto", "Meu EAN", "Loja", "Produto Concorrente", "EAN Concorrente",
+                    "Preco Normal", "Preco Oferta", "Similaridade %", "Faixa", "URL"])
+        for ln in linhas:
+            w.writerow([ln.get("meu_nome", ""), ln.get("meu_ean", ""), ln.get("loja", ""),
+                        ln.get("produto_concorrente", ""), ln.get("ean_concorrente", ""),
+                        ln.get("preco_normal", "—"), ln.get("preco_oferta", "—"),
+                        ln.get("similaridade", 0), ln.get("faixa", ""), ln.get("url", "")])
+    logger.info("Confronto CSV: %d linha(s) em %s", len(linhas), caminho)
+    return caminho
+
+
 def main():
     seletores = carregar_seletores_personalizados()
     for chave, val in seletores.items():
@@ -3467,7 +3991,7 @@ def main():
 
     status_ia = f"{Fore.GREEN}ativa (Multi-IA: GPT-4o, Gemini 1.5, Groq){Style.RESET_ALL}" if cliente_openai else f"{Fore.RED}desativada (sem OPENAI_API_KEY){Style.RESET_ALL}"
     print(f"\n{Fore.YELLOW}===================================================={Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}   Falcons Data v6.1 - Extrator de Precos e EAN     {Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}   Falcons Data v6.2 - Extrator + Confronto de Catalogo {Style.RESET_ALL}")
     print(f"{Fore.YELLOW}   Aurora | Vizinho | Atacado Uno | Atacado Dois | Rede Continental {Style.RESET_ALL}")
     print(f"{Fore.YELLOW}   Estrela | Economize | Horizonte | Cedro | +3   {Style.RESET_ALL}")
     print(f"{Fore.YELLOW}===================================================={Style.RESET_ALL}")
@@ -3485,6 +4009,7 @@ def main():
                 print("  2. Navegar por categoria/departamento")
                 print("  3. Ver encartes (PDF) — Vizinho")
                 print(f"  {Fore.GREEN}4. Buscar no Google e confrontar com concorrentes{Style.RESET_ALL}")
+                print(f"  {Fore.CYAN}5. Confrontar catalogo (importar CSV nome;ean){Style.RESET_ALL}")
                 print("  0. Sair")
                 if cliente_openai:
                     print(f"   {Fore.MAGENTA}[IA] Normaliza sua busca, sugere alternativas e resume resultados automaticamente.{Style.RESET_ALL}")
@@ -3583,6 +4108,47 @@ def main():
                             for linha_resumo in resumo.split("\n"):
                                 print(f"{Fore.MAGENTA}║  {linha_resumo}{Style.RESET_ALL}")
                             print(f"{Fore.MAGENTA}╚══════════════════════════════════════════════════╝{Style.RESET_ALL}")
+
+                elif opcao == "5":
+                    print(f"\n{Fore.YELLOW}Caminho do CSV (nome;ean) ou 0 p/ voltar: {Style.RESET_ALL}", end="")
+                    caminho_csv = input().strip().strip('"')
+                    if not caminho_csv or caminho_csv == "0":
+                        continue
+                    itens = ler_catalogo_csv(caminho_csv)
+                    if not itens:
+                        print(f"{Fore.RED}Nao consegui ler itens do CSV (esperado colunas nome;ean).{Style.RESET_ALL}")
+                        continue
+                    print(f"{Fore.CYAN}{len(itens)} item(ns) no catalogo. Confrontando com Aurora/Vizinho/Atacado Uno...{Style.RESET_ALL}")
+
+                    def _prog(i, tot, nome):
+                        print(f"   [{i+1}/{tot}] {nome[:50]}")
+
+                    # roda em thread: o confronto usa sync_playwright proprio e o
+                    # menu ja esta dentro de um sync_playwright (nao pode aninhar).
+                    _res = {}
+
+                    def _run_confronto():
+                        _res["linhas"] = confrontar_catalogo(
+                            itens, lojas=["aurora", "vizinho", "atacauno"], callback_progresso=_prog)
+
+                    _t = threading.Thread(target=_run_confronto)
+                    _t.start()
+                    _t.join()
+                    linhas = _res.get("linhas", [])
+                    if not linhas:
+                        print(f"{Fore.YELLOW}Nenhum match encontrado.{Style.RESET_ALL}")
+                        continue
+                    faixas_cont = {}
+                    for l in linhas:
+                        faixas_cont[l["faixa"]] = faixas_cont.get(l["faixa"], 0) + 1
+                    print(f"\n{Fore.GREEN}{len(linhas)} match(es): "
+                          f"Verde={faixas_cont.get('Verde',0)} "
+                          f"Azul={faixas_cont.get('Azul',0)} "
+                          f"Amarelo={faixas_cont.get('Amarelo',0)}{Style.RESET_ALL}")
+                    txt = exportar_confronto_txt(linhas)
+                    csv_det = exportar_confronto_csv(linhas)
+                    print(f"{Fore.CYAN}TXT (EAN;PRECO): {txt}{Style.RESET_ALL}")
+                    print(f"{Fore.CYAN}CSV detalhado:   {csv_det}{Style.RESET_ALL}")
 
                 else:
                     print(f"{Fore.RED}Opcao invalida.{Style.RESET_ALL}")

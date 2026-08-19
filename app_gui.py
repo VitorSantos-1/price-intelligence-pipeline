@@ -91,6 +91,7 @@ class AppPesquisaPreco(ctk.CTk):
             "busca":    {"resultados": [], "buscando": False, "cancelar": threading.Event()},
             "encartes": {"resultados": [], "buscando": False, "cancelar": threading.Event()},
             "monitor":  {"rodando": False, "parar": threading.Event()},
+            "confronto": {"itens": [], "linhas": [], "rodando": False, "cancelar": threading.Event()},
         }
         self._build_layout()
         self._apply_ttk_style()
@@ -117,11 +118,13 @@ class AppPesquisaPreco(ctk.CTk):
         )
         self._tabview.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
         self._tabview._segmented_button.configure(font=ctk.CTkFont("Segoe UI", 13, "bold"))
-        self._tab_busca    = self._tabview.add("  Busca Unificada")
-        self._tab_monitor  = self._tabview.add("  Monitor")
-        self._tab_encartes = self._tabview.add("  Encartes")
-        self._tab_config   = self._tabview.add("  Configuracoes")
+        self._tab_busca     = self._tabview.add("  Busca Unificada")
+        self._tab_confronto = self._tabview.add("  Confronto CSV")
+        self._tab_monitor   = self._tabview.add("  Monitor")
+        self._tab_encartes  = self._tabview.add("  Encartes")
+        self._tab_config    = self._tabview.add("  Configuracoes")
         self._build_tab_busca()
+        self._build_tab_confronto()
         self._build_tab_monitor()
         self._build_tab_encartes()
         self._build_tab_config()
@@ -932,6 +935,232 @@ class AppPesquisaPreco(ctk.CTk):
         self._txt_resumo.delete("1.0", "end")
         self._txt_resumo.insert("end", texto)
         self._txt_resumo.configure(state="disabled")
+
+    # ── Confronto de Catalogo (CSV) ─────────────────────────────────────────────
+    def _build_tab_confronto(self):
+        tab = self._tab_confronto
+        tab.configure(fg_color=C["card"])
+        tab.grid_rowconfigure(4, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        pa = ctk.CTkFrame(tab, fg_color=C["bg"], corner_radius=10)
+        pa.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        pa.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(
+            pa, text="Importar CSV (nome;ean)", font=ctk.CTkFont("Segoe UI", 13, "bold"),
+            fg_color=C["accent"], hover_color="#3a7af5", text_color="white",
+            height=42, width=200, corner_radius=8, command=self._confronto_importar
+        ).grid(row=0, column=0, padx=(16, 8), pady=14)
+        self._lbl_confronto_arquivo = ctk.CTkLabel(
+            pa, text="Nenhum CSV carregado.", font=ctk.CTkFont("Segoe UI", 12),
+            text_color=C["text_dim"], anchor="w")
+        self._lbl_confronto_arquivo.grid(row=0, column=1, sticky="w", padx=8)
+        self._chk_confronto_ia = ctk.CTkCheckBox(
+            pa, text="IA confirma", font=ctk.CTkFont("Segoe UI", 11),
+            fg_color=C["accent"], hover_color=C["accent_hi"], text_color=C["text"],
+            checkmark_color="white", border_color=C["border"])
+        self._chk_confronto_ia.select()
+        self._chk_confronto_ia.grid(row=0, column=2, padx=8)
+        self._btn_confronto = ctk.CTkButton(
+            pa, text="Confrontar", font=ctk.CTkFont("Segoe UI", 13, "bold"),
+            fg_color=C["accent2"], hover_color="#17bf88", text_color=C["bg"],
+            height=42, width=140, corner_radius=8, command=self._confronto_iniciar, state="disabled")
+        self._btn_confronto.grid(row=0, column=3, padx=8, pady=14)
+        self._btn_confronto_canc = ctk.CTkButton(
+            pa, text="Cancelar", font=ctk.CTkFont("Segoe UI", 13, "bold"),
+            fg_color=C["danger"], hover_color="#c0392b", text_color="white",
+            height=42, width=120, corner_radius=8, command=self._confronto_cancelar, state="disabled")
+        self._btn_confronto_canc.grid(row=0, column=4, padx=(0, 16), pady=14)
+
+        pl = ctk.CTkFrame(tab, fg_color=C["bg"], corner_radius=10)
+        pl.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
+        ctk.CTkLabel(pl, text="Lojas:", font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     text_color=C["accent"]).grid(row=0, column=0, sticky="w", padx=12, pady=8)
+        self._confronto_check_vars = {}
+        box = ctk.CTkFrame(pl, fg_color="transparent")
+        box.grid(row=0, column=1, sticky="w")
+        for idx, (chave, nome) in enumerate([("aurora", "Aurora"), ("vizinho", "Vizinho"), ("atacauno", "Atacado Uno")]):
+            var = tk.BooleanVar(value=True)
+            self._confronto_check_vars[chave] = var
+            ctk.CTkCheckBox(box, text=nome, variable=var, font=ctk.CTkFont("Segoe UI", 11),
+                            fg_color=C["accent"], hover_color=C["accent_hi"], text_color=C["text"],
+                            checkmark_color="white", border_color=C["border"], width=120
+                            ).grid(row=0, column=idx, padx=6, pady=6, sticky="w")
+
+        ps = ctk.CTkFrame(tab, fg_color="transparent")
+        ps.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 4))
+        ps.grid_columnconfigure(0, weight=1)
+        self._lbl_confronto_status = ctk.CTkLabel(
+            ps, text="Importe um CSV com colunas nome;ean para comecar.",
+            font=ctk.CTkFont("Segoe UI", 12), text_color=C["text_dim"], anchor="w")
+        self._lbl_confronto_status.grid(row=0, column=0, sticky="w", padx=4)
+        self._confronto_progress = ctk.CTkProgressBar(
+            ps, fg_color=C["border"], progress_color=C["accent2"], height=4, corner_radius=2)
+        self._confronto_progress.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 0))
+        self._confronto_progress.set(0)
+
+        leg = ctk.CTkFrame(tab, fg_color="transparent")
+        leg.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 2))
+        for cor, txt in [(C["accent2"], "Verde: EAN oficial"), ("#4ea3f2", "Azul: NLP/IA forte"),
+                         (C["accent3"], "Amarelo: conferir"), (C["text_dim"], ">=75% = mesmo produto")]:
+            ctk.CTkLabel(leg, text="  ● " + txt, font=ctk.CTkFont("Segoe UI", 10),
+                         text_color=cor).pack(side="left", padx=4)
+
+        ft = ctk.CTkFrame(tab, fg_color=C["bg"], corner_radius=10)
+        ft.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 6))
+        ft.grid_rowconfigure(0, weight=1)
+        ft.grid_columnconfigure(0, weight=1)
+        self._tree_confronto = self._criar_tabela(ft, [
+            ("#", 40), ("Meu Produto", 200), ("Meu EAN", 120), ("Loja", 110),
+            ("Produto Concorrente", 250), ("EAN", 120), ("Preco Normal", 100),
+            ("Preco Oferta", 100), ("Sim%", 60), ("Faixa", 80)
+        ])
+        self._tree_confronto.tag_configure("verde",   foreground=C["accent2"])
+        self._tree_confronto.tag_configure("azul",    foreground="#4ea3f2")
+        self._tree_confronto.tag_configure("amarelo", foreground=C["accent3"])
+        self._tree_confronto.tag_configure("naoenc",  foreground=C["text_dim"])
+
+        pe = ctk.CTkFrame(tab, fg_color="transparent")
+        pe.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 12))
+        ctk.CTkButton(pe, text="Exportar TXT (EAN;PRECO)", font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                      fg_color=C["accent"], hover_color="#3a7af5", text_color="white",
+                      height=36, width=210, corner_radius=8, command=self._confronto_exportar_txt
+                      ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(pe, text="Exportar CSV detalhado", font=ctk.CTkFont("Segoe UI", 12),
+                      fg_color=C["border"], hover_color=C["card_hover"], text_color=C["text"],
+                      height=36, width=190, corner_radius=8, command=self._confronto_exportar_csv
+                      ).pack(side="left")
+
+    def _confronto_importar(self):
+        caminho = filedialog.askopenfilename(
+            title="Selecione o CSV (nome;ean)",
+            filetypes=[("CSV", "*.csv"), ("Texto", "*.txt"), ("Todos", "*.*")])
+        if not caminho:
+            return
+        try:
+            itens = engine.ler_catalogo_csv(caminho)
+        except Exception as ex:
+            messagebox.showerror("Erro ao ler CSV", str(ex))
+            return
+        if not itens:
+            messagebox.showwarning("CSV vazio", "Nao encontrei itens. Esperado colunas nome;ean.")
+            return
+        self._estados["confronto"]["itens"] = itens
+        com_ean = sum(1 for it in itens if it.get("ean"))
+        self._lbl_confronto_arquivo.configure(
+            text=f"{os.path.basename(caminho)}  —  {len(itens)} itens ({com_ean} com EAN)")
+        self._lbl_confronto_status.configure(text="Pronto. Clique em Confrontar.")
+        self._btn_confronto.configure(state="normal")
+
+    def _confronto_iniciar(self):
+        estado = self._estados["confronto"]
+        if estado["rodando"]:
+            return
+        itens = estado["itens"]
+        if not itens:
+            messagebox.showwarning("Sem catalogo", "Importe um CSV primeiro.")
+            return
+        lojas = [k for k, v in self._confronto_check_vars.items() if v.get()]
+        if not lojas:
+            messagebox.showwarning("Sem lojas", "Selecione ao menos uma loja.")
+            return
+        usar_ia = bool(self._chk_confronto_ia.get())
+        estado["rodando"] = True
+        estado["cancelar"].clear()
+        estado["linhas"] = []
+        self._limpar_tabela(self._tree_confronto)
+        self._btn_confronto.configure(state="disabled")
+        self._btn_confronto_canc.configure(state="normal")
+        self._confronto_progress.set(0)
+        workers = int(self._slider_workers.get()) if hasattr(self, "_slider_workers") else 4
+        timeout = int(self._slider_timeout.get()) if hasattr(self, "_slider_timeout") else 45
+
+        def _prog(i, tot, nome):
+            frac = i / max(tot, 1)
+            self.after(0, lambda: self._confronto_progress.set(frac))
+            self.after(0, lambda: self._lbl_confronto_status.configure(
+                text=f"[{i+1}/{tot}] Confrontando: {nome[:45]}"))
+
+        def _thread():
+            try:
+                linhas = engine.confrontar_catalogo(
+                    itens, lojas=lojas, parar_event=estado["cancelar"],
+                    max_workers=workers, timeout_por_loja=timeout,
+                    usar_ia=usar_ia, callback_progresso=_prog)
+                estado["linhas"] = linhas
+                self.after(0, self._confronto_finalizar, linhas)
+            except Exception as ex:
+                self.after(0, self._confronto_erro, str(ex))
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _confronto_finalizar(self, linhas):
+        estado = self._estados["confronto"]
+        estado["rodando"] = False
+        self._btn_confronto.configure(state="normal")
+        self._btn_confronto_canc.configure(state="disabled")
+        self._confronto_progress.set(1.0 if linhas else 0)
+        if not linhas:
+            self._lbl_confronto_status.configure(text="Nenhum match encontrado.")
+            return
+        cont = {}
+        for l in linhas:
+            cont[l.get("faixa", "")] = cont.get(l.get("faixa", ""), 0) + 1
+        nenc = cont.get("Nao encontrado", 0)
+        matches = len(linhas) - nenc
+        self._lbl_confronto_status.configure(
+            text=(f"{len(linhas)} linha(s) — {matches} match(es):  "
+                  f"Verde {cont.get('Verde',0)} | Azul {cont.get('Azul',0)} | "
+                  f"Amarelo {cont.get('Amarelo',0)} | Nao encontrado {nenc}"))
+        self._confronto_popular(linhas)
+
+    def _confronto_popular(self, linhas):
+        self._limpar_tabela(self._tree_confronto)
+        tag_por_faixa = {"Verde": "verde", "Azul": "azul", "Amarelo": "amarelo", "Nao encontrado": "naoenc"}
+        for i, l in enumerate(linhas):
+            tag = tag_por_faixa.get(l.get("faixa", ""), "impar")
+            self._tree_confronto.insert("", "end", values=(
+                i + 1, l.get("meu_nome", ""), l.get("meu_ean", "") or "—", l.get("loja", ""),
+                l.get("produto_concorrente", ""), l.get("ean_concorrente", "") or "—",
+                l.get("preco_normal", "—"), l.get("preco_oferta", "—"),
+                l.get("similaridade", 0), l.get("faixa", "")
+            ), tags=(tag,))
+
+    def _confronto_erro(self, msg):
+        estado = self._estados["confronto"]
+        estado["rodando"] = False
+        self._btn_confronto.configure(state="normal")
+        self._btn_confronto_canc.configure(state="disabled")
+        self._lbl_confronto_status.configure(text=f"Erro: {msg[:80]}")
+
+    def _confronto_cancelar(self):
+        self._estados["confronto"]["cancelar"].set()
+        self._lbl_confronto_status.configure(text="Cancelando...")
+        self._btn_confronto_canc.configure(state="disabled")
+
+    def _confronto_exportar_txt(self):
+        linhas = self._estados["confronto"]["linhas"]
+        if not linhas:
+            messagebox.showinfo("Exportar", "Rode um confronto primeiro.")
+            return
+        caminho = filedialog.asksaveasfilename(
+            defaultextension=".txt", filetypes=[("Texto", "*.txt"), ("Todos", "*.*")],
+            initialfile=f"confronto_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        if caminho:
+            engine.exportar_confronto_txt(linhas, caminho)
+            messagebox.showinfo("Exportado", f"TXT (EAN;PRECO) salvo!\n{caminho}")
+
+    def _confronto_exportar_csv(self):
+        linhas = self._estados["confronto"]["linhas"]
+        if not linhas:
+            messagebox.showinfo("Exportar", "Rode um confronto primeiro.")
+            return
+        caminho = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("Todos", "*.*")],
+            initialfile=f"confronto_detalhado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        if caminho:
+            engine.exportar_confronto_csv(linhas, caminho)
+            messagebox.showinfo("Exportado", f"CSV detalhado salvo!\n{caminho}")
 
     def _exportar_csv(self):
         tab = self._tabview.get()

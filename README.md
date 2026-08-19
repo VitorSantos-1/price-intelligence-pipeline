@@ -18,6 +18,8 @@ Evoluído por várias versões até o app desktop **Falcons Data**, com **interf
   guarda em um `selectors.json` (cache gerado em tempo de execução, fora do repositório).
 - **Monitor de preços:** watchlist de produtos com histórico persistido em **SQLite** para acompanhar variação.
 - **Sites customizados:** o próprio usuário cadastra novas lojas (URL de busca) para entrarem na coleta.
+- **Casamento por catálogo:** compara um catálogo próprio (CSV) com os produtos das redes, casando por
+  **EAN** e por similaridade de nome, com **confirmação por IA** quando o match é ambíguo.
 - Envia os resultados para **4 provedores de LLM** (Gemini, Groq/Llama, GPT-4o-mini via OpenRouter e HuggingFace)
   e gera um resumo curto: loja mais barata, diferença %, ofertas.
 - Exporta os resultados em **CSV** e registra tudo em **logs estruturados**.
