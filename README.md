@@ -54,6 +54,58 @@ diário.
 
 ---
 
+## Telas do Aplicativo
+
+O pipeline também é um aplicativo desktop, para o time comercial usar sem ambiente técnico. Cada aba
+resolve um problema — abaixo, tela por tela (dados fictícios; nomes das lojas concorrentes ocultados).
+
+### 1. Busca Geral
+
+Busco um produto e o sistema varre todas as lojas monitoradas ao mesmo tempo — preço normal, preço de
+oferta, código de barras, em quantas lojas aparece e o menor preço do mercado. Cada linha mostra até o
+método de extração usado.
+
+![Busca Geral](docs/screenshots/01-busca-geral.png)
+
+### 2. Busca Unificada
+
+Junta os resultados por loja em um único produto por concorrente, com uma **nota de confiança** de que
+achou o produto certo — e não só um parecido. Inclui filtros (faixa de preço, marca, só com EAN,
+ordenação) e seleção de região/unidade.
+
+![Busca Unificada](docs/screenshots/02-busca-unificada.png)
+
+### 3. Confronto CSV
+
+Subo minha lista de produtos (nome + código de barras) e o sistema **casa item a item** com o catálogo
+de cada concorrente, classificado por confiança: código bateu (🟢 verde), nome bateu forte (🔵 azul)
+ou precisa conferir (🟡 amarelo). Exporta em TXT, CSV, Excel e PDF.
+
+![Confronto CSV](docs/screenshots/03-confronto-csv.png)
+
+### 4. Monitor
+
+Escolho um produto entre as opções encontradas (cada uma com seu % de confiança) e o sistema
+**acompanha o preço ao longo do tempo**, comparando com o valor anterior e avisando quando cruza um
+preço-alvo.
+
+![Monitor](docs/screenshots/04-monitor.png)
+
+### 5. Encartes _(em testes)_
+
+Lê os encartes promocionais dos concorrentes, inclusive em PDF — porque promoção pontual nem sempre
+aparece numa busca comum no site.
+
+### 6. Configurações
+
+Ajusto o motor: quantas lojas ele varre em paralelo, tempo limite por loja, e cadastro concorrentes
+novos só colando a URL de busca. Tem também um **diagnóstico de saúde das lojas** (🟢/🔴 + latência),
+que detecta cedo quando uma fonte interna muda ou cai.
+
+![Configurações](docs/screenshots/05-configuracoes.png)
+
+---
+
 ## Arquitetura e Abordagem Técnica
 
 ```text
@@ -127,6 +179,19 @@ resultados_csv/        -> Saídas em CSV (exemplo fictício incluído)
 
 > `selectors.json` e o banco local não são versionados: o primeiro é um cache gerado em runtime; o
 > segundo é criado a partir de `sql/schema.sql` no seu ambiente.
+
+## O que este projeto me ensinou
+
+Este projeto virou meu laboratório para pensar como **engenheiro e cientista de dados ao mesmo tempo** —
+fazer funcionar quando a fonte muda, o modelo erra e o dado chega sujo.
+
+- **Engenharia de dados** — o pipeline: coletar de fontes instáveis em paralelo sem travar, guardar o
+  histórico de preço de forma confiável e usar cache para não reprocessar o que já foi validado.
+- **Ciência de dados** — o motor de comparação de produto, construído do zero, capaz de reconhecer que
+  "Leite em Pó Ninho 380g" e "Leite Ninho Pó Integral 380 g" são o mesmo item — e o uso de IA em
+  consenso para interpretar buscas e, quando a coleta falha, até ler o print da tela.
+- **Análise de dados** — decidir o que realmente importa mostrar: todo resultado vem com um nível de
+  confiança, porque decisão de preço não pode ser tomada em cima de um match errado.
 
 ## Autor
 
